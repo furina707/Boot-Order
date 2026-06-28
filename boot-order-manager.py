@@ -692,7 +692,8 @@ class BootOrderTUI:
             # Draw text
             self.stdscr.addstr(dialog_y + dialog_h // 2, dialog_x + 2,
                                text, curses.color_pair(self.HIGHLIGHT) | curses.A_BOLD)
-            self.stdscr.refresh()
+            self.stdscr.noutrefresh()
+            curses.doupdate()
 
             # Wait for keypress
             key = self.stdscr.getch()
@@ -751,10 +752,11 @@ class BootOrderTUI:
                     except curses.error:
                         pass
 
-                self.stdscr.refresh()
+                self.stdscr.noutrefresh()
+                curses.doupdate()
 
                 key = self.stdscr.getch()
-                if key in [ord('q'), ord('Q'), 27, ord('\n'), ord(' ')]:  # q, ESC, Enter, Space
+                if key in [ord('q'), ord('Q'), 27, ord('\n'), ord(' ')]:
                     break
                 elif key in [curses.KEY_DOWN, ord('j')] and scroll_offset < max_scroll:
                     scroll_offset += 1
@@ -818,10 +820,11 @@ class BootOrderTUI:
                 self.stdscr.addstr(dialog_y + 5, dialog_x + 2, hint,
                                    curses.color_pair(self.HELP))
 
-                self.stdscr.refresh()
+                self.stdscr.noutrefresh()
+                curses.doupdate()
 
                 key = self.stdscr.getch()
-                if key == 27:  # ESC
+                if key == 27:
                     return None
                 elif key in [10, 13, curses.KEY_ENTER]:  # Enter
                     return "".join(result)
