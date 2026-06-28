@@ -2,6 +2,9 @@
 """
 Boot Order Manager - TUI for managing UEFI boot entries
 Requires: efibootmgr, Python 3, root privileges for write operations
+
+One-click launch:
+  curl -sL https://raw.githubusercontent.com/furina707/Boot-Order/master/boot-order-manager.py | sudo python3 -
 """
 
 import curses
@@ -909,7 +912,13 @@ class BootOrderTUI:
 
 def main():
     """Application entry point."""
-    # Check for root on write operations (warning only)
+    if not sys.stdin.isatty():
+        try:
+            sys.stdin = open("/dev/tty")
+        except OSError:
+            print("Error: No terminal available for interactive input.", file=sys.stderr)
+            sys.exit(1)
+
     if os.geteuid() != 0:
         print("╔════════════════════════════════════════════════════╗")
         print("║  ⚠  Note: Running without root privileges        ║")
