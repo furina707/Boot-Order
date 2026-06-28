@@ -234,7 +234,7 @@ class BootOrderTUI:
     def draw(self):
         """Main draw method."""
         self.max_y, self.max_x = self.stdscr.getmaxyx()
-        self.stdscr.clear()
+        self.stdscr.erase()
 
         if self.max_y < 10 or self.max_x < 50:
             self._draw_min_size_warning()
@@ -246,6 +246,7 @@ class BootOrderTUI:
         self._draw_footer()
         self._draw_message()
         self.stdscr.noutrefresh()
+        curses.doupdate()
 
     def _draw_min_size_warning(self):
         """Draw warning when terminal is too small."""
@@ -846,7 +847,6 @@ class BootOrderTUI:
 
         while True:
             self.draw()
-            self.stdscr.refresh()
 
             key = self.stdscr.getch()
 
