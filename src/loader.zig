@@ -128,6 +128,113 @@ pub fn writePrivilegedFile(io: Io, allocator: std.mem.Allocator, filepath: []con
     }, stdin_buf);
 }
 
+/// 解析 bootctl list 命令的结构化输出 (获取 systemd-boot 完整识别的全部启动项)
+pub fn parseBootctlList(allocator: std.mem.Allocator, text: []const u8, default_entry: []const u8) !std.ArrayList(LoaderEntry) {
+    var entries = std.ArrayList(LoaderEntry).empty;
+    errdefer {
+        for (entries.items) |*e| e.deinit(allocator);
+        entries.deinit(allocator);
+    }
+
+    var id: []const u8 = "";
+    var title: []const u8 = "";
+    var linux_path: []const u8 = "";
+    var efi_path: []const u8 = "";
+    var options_str: []const u8 = "";
+    var is_def = false;
+    var has_windows_conf = false;
+
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, "\r\t ");
+        if (line.len == 0) {
+            if (id.len > 0) {
+                // 若已有 windows.conf，则自动抑制重复的 auto-windows
+                if (std.mem.eql(u8, id, "auto-windows") and has_windows_conf) {
+                    id = "";
+                    title = "";
+                    linux_path = "";
+                    efi_path = "";
+                    options_str = "";
+                    is_def = false;
+                    continue;
+                }
+
+                if (std.mem.eql(u8, id, "windows.conf")) {
+                    has_windows_conf = true;
+                }
+
+                if (title.len == 0) title = id;
+                if (default_entry.len > 0 and (std.mem.eql(u8, id, default_entry) or std.mem.startsWith(u8, id, default_entry))) {
+                    is_def = true;
+                }
+                const is_conf = std.mem.endsWith(u8, id, ".conf");
+                try entries.append(allocator, .{
+                    .id = try allocator.dupe(u8, id),
+                    .title = try allocator.dupe(u8, title),
+                    .linux = try allocator.dupe(u8, linux_path),
+                    .options = try allocator.dupe(u8, options_str),
+                    .efi = try allocator.dupe(u8, efi_path),
+                    .is_default = is_def,
+                    .is_conf_file = is_conf,
+                });
+                id = "";
+                title = "";
+                linux_path = "";
+                efi_path = "";
+                options_str = "";
+                is_def = false;
+            }
+            continue;
+        }
+
+        const colon_idx = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const key = std.mem.trim(u8, line[0..colon_idx], " \t");
+        const val = std.mem.trim(u8, line[colon_idx + 1 ..], " \t");
+
+        if (std.mem.eql(u8, key, "id")) {
+            id = val;
+        } else if (std.mem.eql(u8, key, "title")) {
+            var clean_title = val;
+            if (std.mem.endsWith(u8, clean_title, "(default)")) {
+                clean_title = std.mem.trim(u8, clean_title[0 .. clean_title.len - 9], " \t");
+                is_def = true;
+            }
+            if (std.mem.endsWith(u8, clean_title, "(selected)")) {
+                clean_title = std.mem.trim(u8, clean_title[0 .. clean_title.len - 10], " \t");
+            }
+            title = clean_title;
+        } else if (std.mem.eql(u8, key, "linux")) {
+            linux_path = val;
+        } else if (std.mem.eql(u8, key, "efi")) {
+            efi_path = val;
+        } else if (std.mem.eql(u8, key, "options")) {
+            options_str = val;
+        }
+    }
+
+    if (id.len > 0) {
+        if (!std.mem.eql(u8, id, "auto-windows") or !has_windows_conf) {
+            if (title.len == 0) title = id;
+            if (default_entry.len > 0 and (std.mem.eql(u8, id, default_entry) or std.mem.startsWith(u8, id, default_entry))) {
+                is_def = true;
+            }
+            const is_conf = std.mem.endsWith(u8, id, ".conf");
+            try entries.append(allocator, .{
+                .id = try allocator.dupe(u8, id),
+                .title = try allocator.dupe(u8, title),
+                .linux = try allocator.dupe(u8, linux_path),
+                .options = try allocator.dupe(u8, options_str),
+                .efi = try allocator.dupe(u8, efi_path),
+                .is_default = is_def,
+                .is_conf_file = is_conf,
+            });
+        }
+    }
+
+    return entries;
+}
+
 /// 读取并解析 systemd-boot 的全部内层配置与条目
 pub fn loadConfig(io: Io, allocator: std.mem.Allocator) !LoaderConfig {
     var config = LoaderConfig.init(allocator);
@@ -157,7 +264,30 @@ pub fn loadConfig(io: Io, allocator: std.mem.Allocator) !LoaderConfig {
     if (config.timeout.len == 0) config.timeout = try allocator.dupe(u8, "menu-force");
     if (config.console_mode.len == 0) config.console_mode = try allocator.dupe(u8, "max");
 
-    // 2. 列出 /boot/loader/entries/ 下的所有 .conf 条目
+    // 2. 优先通过 sudo bootctl list 获取 systemd-boot 的全部真实启动项 (包含 UKI 与自动条目)
+    const bctl_res = sys.runWithStdin(io, allocator, &.{
+        "sudo",
+        "-S",
+        "-p",
+        "",
+        "bootctl",
+        "list",
+    }, DEFAULT_SUDO_PASS) catch null;
+
+    if (bctl_res) |br| {
+        defer br.deinit(allocator);
+        if (br.exit_code == 0 and br.stdout.len > 0) {
+            const bctl_entries = parseBootctlList(allocator, br.stdout, config.default_entry) catch null;
+            if (bctl_entries) |be| {
+                if (be.items.len > 0) {
+                    config.entries = be;
+                    return config;
+                }
+            }
+        }
+    }
+
+    // 3. Fallback: 手动扫描 /boot/loader/entries/ 下的所有 .conf 条目
     const ls_res = sys.runWithStdin(io, allocator, &.{
         "sudo",
         "-S",
@@ -223,8 +353,17 @@ pub fn loadConfig(io: Io, allocator: std.mem.Allocator) !LoaderConfig {
         }
     }
 
-    // 3. 检查是否存在 UKI 条目 (/boot/EFI/Linux/arch-linux.efi)
-    const uki_check = sys.run(io, allocator, &.{ "test", "-f", "/boot/EFI/Linux/arch-linux.efi" }) catch null;
+    // 4. 检查是否存在 UKI 条目 (/boot/EFI/Linux/arch-linux.efi)
+    const uki_check = sys.runWithStdin(io, allocator, &.{
+        "sudo",
+        "-S",
+        "-p",
+        "",
+        "test",
+        "-f",
+        "/boot/EFI/Linux/arch-linux.efi",
+    }, DEFAULT_SUDO_PASS) catch null;
+
     if (uki_check) |uc| {
         defer uc.deinit(allocator);
         if (uc.exit_code == 0) {

@@ -1116,7 +1116,7 @@ const LoaderEntrySnapshot = struct {
     options_len: usize,
     is_conf_file: bool,
 };
-var cached_entries: [8]LoaderEntrySnapshot = undefined;
+var cached_entries: [16]LoaderEntrySnapshot = undefined;
 var cached_entries_count: usize = 0;
 
 fn onEditClicked(_: *c.GtkButton, user_data: ?*anyopaque) callconv(.c) void {
@@ -1251,20 +1251,28 @@ fn openLoaderEntriesDisplay() void {
         c.gtk_box_append(@ptrCast(tr), @ptrCast(title_lbl));
 
         // 类型药丸
-        const type_str = if (e.linux.len > 0)
+        const type_str = if (std.mem.endsWith(u8, e.id, ".efi"))
+            "UKI 镜像"
+        else if (std.mem.startsWith(u8, e.id, "auto-"))
+            "固件工具"
+        else if (e.linux.len > 0)
             "Linux 内核"
         else if (e.efi.len > 0)
             "Windows EFI"
         else
-            "UKI 镜像";
+            "系统引导";
         const type_lbl = c.gtk_label_new(gtk.s(type_str));
         c.gtk_widget_add_css_class(@ptrCast(type_lbl), gtk.s("pill-badge"));
-        if (e.linux.len > 0) {
+        if (std.mem.endsWith(u8, e.id, ".efi")) {
+            c.gtk_widget_add_css_class(@ptrCast(type_lbl), gtk.s("badge-amber"));
+        } else if (std.mem.startsWith(u8, e.id, "auto-")) {
+            c.gtk_widget_add_css_class(@ptrCast(type_lbl), gtk.s("badge-gray"));
+        } else if (e.linux.len > 0) {
             c.gtk_widget_add_css_class(@ptrCast(type_lbl), gtk.s("badge-blue"));
         } else if (e.efi.len > 0) {
             c.gtk_widget_add_css_class(@ptrCast(type_lbl), gtk.s("badge-purple"));
         } else {
-            c.gtk_widget_add_css_class(@ptrCast(type_lbl), gtk.s("badge-amber"));
+            c.gtk_widget_add_css_class(@ptrCast(type_lbl), gtk.s("badge-gray"));
         }
         c.gtk_box_append(@ptrCast(tr), @ptrCast(type_lbl));
         c.gtk_box_append(@ptrCast(mid_box), @ptrCast(tr));
