@@ -38,8 +38,13 @@ pub fn main(init: std.process.Init) !u8 {
             std.debug.print("================================================================================\n", .{});
             std.debug.print("              UEFI NVRAM 主板固件启动项与顺序 (efibootmgr)\n", .{});
             std.debug.print("================================================================================\n", .{});
-            std.debug.print("固件超时: {d} 秒  │  单次启动 (BootNext): {s}\n", .{
-                cfg.timeout,
+            const timeout_info = if (cfg.timeout == 0)
+                "0 秒 (取消倒计时直入)"
+            else
+                try std.fmt.allocPrint(allocator, "{d} 秒 (倒计时自动进入)", .{cfg.timeout});
+            defer if (cfg.timeout != 0) allocator.free(timeout_info);
+            std.debug.print("固件超时: {s}  │  单次启动 (BootNext): {s}\n", .{
+                timeout_info,
                 if (cfg.boot_next) |bn| &bn else "无",
             });
 
@@ -230,7 +235,13 @@ pub fn main(init: std.process.Init) !u8 {
             std.debug.print("           Linux Boot Manager (systemd-boot) 内层引导与内核配置\n", .{});
             std.debug.print("================================================================================\n", .{});
             std.debug.print("默认条目 (default):     {s}\n", .{lcfg.default_entry});
-            std.debug.print("菜单倒计时 (timeout):   {s}\n", .{lcfg.timeout});
+            const timeout_display = if (std.mem.eql(u8, lcfg.timeout, "0"))
+                "0 秒 (取消倒计时直接进入)"
+            else if (std.mem.eql(u8, lcfg.timeout, "menu-force"))
+                "menu-force (强制停留菜单，不自动进入)"
+            else
+                lcfg.timeout;
+            std.debug.print("菜单倒计时 (timeout):   {s}\n", .{timeout_display});
             std.debug.print("控制台模式 (console):   {s}\n", .{lcfg.console_mode});
             std.debug.print("--------------------------------------------------------------------------------\n", .{});
 
@@ -406,6 +417,31 @@ pub fn main(init: std.process.Init) !u8 {
                 return 1;
             }
         }
+
+        // 17. 一键全速秒进模式 (--auto-boot / --no-timeout / --direct-boot)
+        if (std.mem.eql(u8, sub, "--auto-boot") or std.mem.eql(u8, sub, "--no-timeout") or std.mem.eql(u8, sub, "--direct-boot")) {
+            const nv_res = try nvram.setTimeout(io, allocator, 0);
+            defer nv_res.deinit(allocator);
+            if (!nv_res.ok()) {
+                std.debug.print("[-] 写入 NVRAM 失败: {s}\n", .{nv_res.stderr});
+                return 1;
+            }
+
+            const ld_res = try loader.setLoaderTimeout(io, allocator, "0");
+            defer ld_res.deinit(allocator);
+            if (!ld_res.ok()) {
+                std.debug.print("[-] 写入 loader.conf 失败: {s}\n", .{ld_res.stderr});
+                return 1;
+            }
+
+            std.debug.print("==================================================\n", .{});
+            std.debug.print("✔ 全速直接自动进入模式已成功开启！\n", .{});
+            std.debug.print("  - 主板固件 NVRAM 倒计时: 0 秒 (取消等待)\n", .{});
+            std.debug.print("  - systemd-boot 菜单倒计时: 0 秒 (取消倒计时直接进入)\n", .{});
+            std.debug.print("  - 开机无需任何按键，闪电直达默认系统！\n", .{});
+            std.debug.print("==================================================\n", .{});
+            return 0;
+        }
     }
 
     // 默认：启动原生 GTK4 图形界面
@@ -435,6 +471,7 @@ fn printHelp() void {
         \\  python run.py --loader-move <源顺位> <目标顺位> 切换调整内层启动条目排位顺序 (更新 sort-key)
         \\  python run.py --loader-sort-key <ID> <KEY> 直接为内层条目设置自定义 sort-key 排序键
         \\  python run.py --loader-delete <ID> 删除指定的内层引导条目文件 (安全移除)
+        \\  python run.py --auto-boot         一键开启全速秒进 (主板与引导器均取消倒计时，0秒直入)
         \\  python run.py -h, --help          显示本帮助
         \\
         \\编辑参数 (配合 --edit 使用):

@@ -449,9 +449,14 @@ pub fn saveGlobalConf(
             if (trimmed.len == 0) continue;
 
             if (startsWithWord(trimmed, "default")) {
-                try new_content.appendSlice(allocator, "default ");
-                try new_content.appendSlice(allocator, default_entry);
-                try new_content.append(allocator, '\n');
+                if (default_entry.len > 0) {
+                    try new_content.appendSlice(allocator, "default ");
+                    try new_content.appendSlice(allocator, default_entry);
+                    try new_content.append(allocator, '\n');
+                } else {
+                    try new_content.appendSlice(allocator, line);
+                    try new_content.append(allocator, '\n');
+                }
                 has_default = true;
             } else if (startsWithWord(trimmed, "timeout")) {
                 try new_content.appendSlice(allocator, "timeout ");
@@ -470,7 +475,7 @@ pub fn saveGlobalConf(
         }
     }
 
-    if (!has_default) {
+    if (!has_default and default_entry.len > 0) {
         try new_content.appendSlice(allocator, "default ");
         try new_content.appendSlice(allocator, default_entry);
         try new_content.append(allocator, '\n');
@@ -487,6 +492,19 @@ pub fn saveGlobalConf(
     }
 
     return writePrivilegedFile(io, allocator, "/boot/loader/loader.conf", new_content.items);
+}
+
+/// 设置内层 systemd-boot 菜单倒计时/自动进入模式 (例如 "0", "3", "5", "menu-force")
+pub fn setLoaderTimeout(io: Io, allocator: std.mem.Allocator, timeout_val: []const u8) !sys.RunResult {
+    var lcfg = try loadConfig(io, allocator);
+    defer lcfg.deinit(allocator);
+    const def_entry = if (lcfg.default_entry.len > 0)
+        lcfg.default_entry
+    else if (lcfg.entries.items.len > 0)
+        lcfg.entries.items[0].id
+    else
+        "";
+    return saveGlobalConf(io, allocator, def_entry, timeout_val, lcfg.console_mode);
 }
 
 /// 保存更新特定条目的配置 (/boot/loader/entries/<id>)
