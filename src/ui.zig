@@ -12,6 +12,7 @@ const gtk = @import("gtk.zig");
 const c = gtk.c;
 const nvram = @import("nvram.zig");
 const sys = @import("sys.zig");
+const sdboot = @import("loader.zig");
 
 pub const meta = struct {
     pub const app_id = "org.arch.BootOrder";
@@ -109,6 +110,20 @@ const CSS_TEXT =
     \\   padding: 10px 14px;
     \\   margin-bottom: 8px;
     \\ }
+    \\ .card-loader {
+    \\   background-color: alpha(@theme_bg_color, 0.6);
+    \\   border: 1px solid alpha(#3584e4, 0.35);
+    \\   border-radius: 12px;
+    \\   padding: 12px 14px;
+    \\   margin-bottom: 8px;
+    \\ }
+    \\ .card-banner {
+    \\   background-color: alpha(#3584e4, 0.12);
+    \\   border: 1.5px solid alpha(#3584e4, 0.5);
+    \\   border-radius: 10px;
+    \\   padding: 10px 14px;
+    \\   margin-bottom: 10px;
+    \\ }
     \\ .pill-badge {
     \\   border-radius: 6px;
     \\   padding: 3px 8px;
@@ -121,6 +136,10 @@ const CSS_TEXT =
     \\ }
     \\ .badge-blue {
     \\   background-color: #3584e4;
+    \\   color: white;
+    \\ }
+    \\ .badge-purple {
+    \\   background-color: #9141ac;
     \\   color: white;
     \\ }
     \\ .badge-amber {
@@ -566,6 +585,21 @@ fn createEntryCard(
     const btn_edit = c.gtk_button_new_with_label(gtk.s("✏ 编辑"));
     _ = c.g_signal_connect_data(@ptrCast(btn_edit), gtk.s("clicked"), @ptrCast(&onEditClicked), user_data, null, 0);
     c.gtk_box_append(@ptrCast(btn_box), btn_edit);
+
+    // 6.1 若该条目为 Linux 引导加载器 (systemd-boot)，直接呈现「⚙ 内层引导」快捷入口
+    const is_sd_boot = if (maybe_entry) |e|
+        (std.mem.indexOf(u8, e.path, "systemd-boot") != null or
+            std.mem.indexOf(u8, e.title, "Linux Boot Manager") != null or
+            std.mem.indexOf(u8, e.title, "Arch Linux") != null)
+    else
+        false;
+
+    if (is_sd_boot) {
+        const btn_loader = c.gtk_button_new_with_label(gtk.s("⚙ 内层引导"));
+        c.gtk_widget_add_css_class(@ptrCast(btn_loader), gtk.s("suggested-action"));
+        _ = c.g_signal_connect_data(@ptrCast(btn_loader), gtk.s("clicked"), @ptrCast(&onOpenLoaderConfig), null, null, 0);
+        c.gtk_box_append(@ptrCast(btn_box), btn_loader);
+    }
 
     // 7. 删除（安全模态确认防误触）
     const btn_del = c.gtk_button_new_with_label(gtk.s("🗑"));
@@ -1072,6 +1106,32 @@ fn onEditClicked(_: *c.GtkButton, user_data: ?*anyopaque) callconv(.c) void {
         }
     }
 
+    // 若当前条目为 systemd-boot / Linux Boot Manager，在弹窗顶部展示醒目的内层引导快捷横幅
+    if (std.mem.indexOf(u8, cur_path, "systemd-boot") != null or
+        std.mem.indexOf(u8, cur_title, "Linux Boot Manager") != null or
+        std.mem.indexOf(u8, cur_title, "Arch Linux") != null)
+    {
+        const banner = c.gtk_box_new(@intCast(c.GTK_ORIENTATION_VERTICAL), 6);
+        c.gtk_widget_add_css_class(@ptrCast(banner), gtk.s("card-banner"));
+
+        const ban_title = c.gtk_label_new(gtk.s("🐧 检测到该条目为 Linux 引导加载器 (systemd-boot)"));
+        c.gtk_label_set_xalign(@ptrCast(ban_title), 0.0);
+        c.gtk_widget_add_css_class(@ptrCast(ban_title), gtk.s("entry-title"));
+        c.gtk_box_append(@ptrCast(banner), @ptrCast(ban_title));
+
+        const ban_desc = c.gtk_label_new(gtk.s("包含内部系统内核选择 (Zen 内核 / UKI)、引导菜单倒计时与 cmdline 内核参数。"));
+        c.gtk_label_set_xalign(@ptrCast(ban_desc), 0.0);
+        c.gtk_widget_add_css_class(@ptrCast(ban_desc), gtk.s("entry-sub"));
+        c.gtk_box_append(@ptrCast(banner), @ptrCast(ban_desc));
+
+        const ban_btn = c.gtk_button_new_with_label(gtk.s("👉 点击直接编辑内层内核与引导项 (loader.conf / cmdline) ➔"));
+        c.gtk_widget_add_css_class(@ptrCast(ban_btn), gtk.s("suggested-action"));
+        _ = c.g_signal_connect_data(@ptrCast(ban_btn), gtk.s("clicked"), @ptrCast(&onOpenLoaderFromEdit), null, null, 0);
+        c.gtk_box_append(@ptrCast(banner), @ptrCast(ban_btn));
+
+        c.gtk_box_append(@ptrCast(box), @ptrCast(banner));
+    }
+
     // 预设快速替换行
     const preset_box = c.gtk_box_new(@intCast(c.GTK_ORIENTATION_HORIZONTAL), 6);
     const p1 = c.gtk_button_new_with_label(gtk.s("预设: systemd-boot"));
@@ -1187,4 +1247,353 @@ fn onSaveEditEntry(_: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
         }
     }
     onCloseEditDialog(@ptrCast(c.gtk_button_new()), null);
+}
+
+// ============================================================================
+// systemd-boot 内层引导项与内核参数管理界面
+// ============================================================================
+
+var loader_dialog: ?*c.GtkWindow = null;
+var loader_default_entry: ?*c.GtkEntry = null;
+var loader_timeout_entry: ?*c.GtkEntry = null;
+var loader_console_entry: ?*c.GtkEntry = null;
+
+const LoaderWidgetPair = struct {
+    id_buf: [64]u8,
+    id_len: usize,
+    title_entry: *c.GtkEntry,
+    options_entry: ?*c.GtkEntry,
+};
+var loader_widget_pairs: [8]LoaderWidgetPair = undefined;
+var loader_widget_count: usize = 0;
+
+fn onOpenLoaderFromEdit(_: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
+    onCloseEditDialog(@ptrCast(c.gtk_button_new()), null);
+    onOpenLoaderConfig(@ptrCast(c.gtk_button_new()), null);
+}
+
+fn onOpenLoaderConfig(_: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
+    var lcfg = sdboot.loadConfig(state.io, state.gpa) catch |err| {
+        showStatus(gtk.zfmt("[-] 读取内层引导配置失败: {s}", .{@errorName(err)}), true);
+        return;
+    };
+    defer lcfg.deinit(state.gpa);
+
+    const dialog = c.gtk_window_new();
+    loader_dialog = @ptrCast(dialog);
+
+    c.gtk_window_set_title(@ptrCast(dialog), gtk.s("管理 Linux Boot Manager 内层引导项 (systemd-boot)"));
+    c.gtk_window_set_transient_for(@ptrCast(dialog), state.window);
+    c.gtk_window_set_modal(@ptrCast(dialog), 1);
+    c.gtk_window_set_default_size(@ptrCast(dialog), 720, 620);
+
+    const scrolled = c.gtk_scrolled_window_new();
+    c.gtk_scrolled_window_set_policy(@ptrCast(scrolled), @intCast(c.GTK_POLICY_NEVER), @intCast(c.GTK_POLICY_AUTOMATIC));
+
+    const content_box = c.gtk_box_new(@intCast(c.GTK_ORIENTATION_VERTICAL), 12);
+    c.gtk_widget_set_margin_start(@ptrCast(content_box), 22);
+    c.gtk_widget_set_margin_end(@ptrCast(content_box), 22);
+    c.gtk_widget_set_margin_top(@ptrCast(content_box), 16);
+    c.gtk_widget_set_margin_bottom(@ptrCast(content_box), 18);
+
+    // ── 顶部说明卡片 ──
+    const top_card = c.gtk_box_new(@intCast(c.GTK_ORIENTATION_VERTICAL), 4);
+    c.gtk_widget_add_css_class(@ptrCast(top_card), gtk.s("card-banner"));
+
+    const head_lbl = c.gtk_label_new(gtk.s("🐧 Linux Boot Manager (systemd-boot) 内层配置与内核参数"));
+    c.gtk_label_set_xalign(@ptrCast(head_lbl), 0.0);
+    c.gtk_widget_add_css_class(@ptrCast(head_lbl), gtk.s("entry-title"));
+    c.gtk_box_append(@ptrCast(top_card), @ptrCast(head_lbl));
+
+    const desc_lbl = c.gtk_label_new(gtk.s("直接维护 ESP 分区中的 /boot/loader/loader.conf 与 entries/*.conf 引导文件。"));
+    c.gtk_label_set_xalign(@ptrCast(desc_lbl), 0.0);
+    c.gtk_widget_add_css_class(@ptrCast(desc_lbl), gtk.s("entry-sub"));
+    c.gtk_box_append(@ptrCast(top_card), @ptrCast(desc_lbl));
+
+    c.gtk_box_append(@ptrCast(content_box), @ptrCast(top_card));
+
+    // ── 分组 1: 全局引导配置 (loader.conf) ──
+    const global_card = c.gtk_box_new(@intCast(c.GTK_ORIENTATION_VERTICAL), 8);
+    c.gtk_widget_add_css_class(@ptrCast(global_card), gtk.s("card-loader"));
+
+    const g_title = c.gtk_label_new(gtk.s("⚙ 全局引导配置 (/boot/loader/loader.conf)"));
+    c.gtk_label_set_xalign(@ptrCast(g_title), 0.0);
+    c.gtk_widget_add_css_class(@ptrCast(g_title), gtk.s("entry-title"));
+    c.gtk_box_append(@ptrCast(global_card), @ptrCast(g_title));
+
+    // 1.1 默认引导项
+    const def_box = c.gtk_box_new(@intCast(c.GTK_ORIENTATION_VERTICAL), 4);
+    const def_lbl = c.gtk_label_new(gtk.s("默认首选启动项 (default):"));
+    c.gtk_label_set_xalign(@ptrCast(def_lbl), 0.0);
+    c.gtk_widget_add_css_class(@ptrCast(def_lbl), gtk.s("entry-sub"));
+    c.gtk_box_append(@ptrCast(def_box), @ptrCast(def_lbl));
+
+    // 预设按钮组
+    const def_btn_box = c.gtk_box_new(@intCast(c.GTK_ORIENTATION_HORIZONTAL), 6);
+    const b_zen = c.gtk_button_new_with_label(gtk.s("★ 设为 Zen 内核"));
+    _ = c.g_signal_connect_data(@ptrCast(b_zen), gtk.s("clicked"), @ptrCast(&onLoaderPresetZen), null, null, 0);
+    c.gtk_box_append(@ptrCast(def_btn_box), b_zen);
+
+    const b_win = c.gtk_button_new_with_label(gtk.s("★ 设为 Windows 11"));
+    _ = c.g_signal_connect_data(@ptrCast(b_win), gtk.s("clicked"), @ptrCast(&onLoaderPresetWin), null, null, 0);
+    c.gtk_box_append(@ptrCast(def_btn_box), b_win);
+
+    const b_uki = c.gtk_button_new_with_label(gtk.s("★ 设为 UKI 镜像"));
+    _ = c.g_signal_connect_data(@ptrCast(b_uki), gtk.s("clicked"), @ptrCast(&onLoaderPresetUki), null, null, 0);
+    c.gtk_box_append(@ptrCast(def_btn_box), b_uki);
+
+    c.gtk_box_append(@ptrCast(def_box), @ptrCast(def_btn_box));
+
+    const def_entry = c.gtk_entry_new();
+    c.gtk_editable_set_text(@ptrCast(def_entry), gtk.s(gtk.zstr(lcfg.default_entry)));
+    loader_default_entry = @ptrCast(def_entry);
+    c.gtk_box_append(@ptrCast(def_box), @ptrCast(def_entry));
+    c.gtk_box_append(@ptrCast(global_card), @ptrCast(def_box));
+
+    // 1.2 超时时间
+    const tm_box = c.gtk_box_new(@intCast(c.GTK_ORIENTATION_VERTICAL), 4);
+    const tm_lbl = c.gtk_label_new(gtk.s("引导菜单倒计时超时 (timeout):"));
+    c.gtk_label_set_xalign(@ptrCast(tm_lbl), 0.0);
+    c.gtk_widget_add_css_class(@ptrCast(tm_lbl), gtk.s("entry-sub"));
+    c.gtk_box_append(@ptrCast(tm_box), @ptrCast(tm_lbl));
+
+    const tm_btn_box = c.gtk_box_new(@intCast(c.GTK_ORIENTATION_HORIZONTAL), 6);
+    const bt_force = c.gtk_button_new_with_label(gtk.s("常驻菜单 (menu-force)"));
+    _ = c.g_signal_connect_data(@ptrCast(bt_force), gtk.s("clicked"), @ptrCast(&onLoaderTimeoutMenuForce), null, null, 0);
+    c.gtk_box_append(@ptrCast(tm_btn_box), bt_force);
+
+    const bt_3 = c.gtk_button_new_with_label(gtk.s("3 秒"));
+    _ = c.g_signal_connect_data(@ptrCast(bt_3), gtk.s("clicked"), @ptrCast(&onLoaderTimeout3s), null, null, 0);
+    c.gtk_box_append(@ptrCast(tm_btn_box), bt_3);
+
+    const bt_5 = c.gtk_button_new_with_label(gtk.s("5 秒"));
+    _ = c.g_signal_connect_data(@ptrCast(bt_5), gtk.s("clicked"), @ptrCast(&onLoaderTimeout5s), null, null, 0);
+    c.gtk_box_append(@ptrCast(tm_btn_box), bt_5);
+
+    const bt_0 = c.gtk_button_new_with_label(gtk.s("跳过菜单 (0 秒)"));
+    _ = c.g_signal_connect_data(@ptrCast(bt_0), gtk.s("clicked"), @ptrCast(&onLoaderTimeout0s), null, null, 0);
+    c.gtk_box_append(@ptrCast(tm_btn_box), bt_0);
+
+    c.gtk_box_append(@ptrCast(tm_box), @ptrCast(tm_btn_box));
+
+    const tm_entry = c.gtk_entry_new();
+    c.gtk_editable_set_text(@ptrCast(tm_entry), gtk.s(gtk.zstr(lcfg.timeout)));
+    loader_timeout_entry = @ptrCast(tm_entry);
+    c.gtk_box_append(@ptrCast(tm_box), @ptrCast(tm_entry));
+    c.gtk_box_append(@ptrCast(global_card), @ptrCast(tm_box));
+
+    // 1.3 控制台分辨率
+    const cs_box = c.gtk_box_new(@intCast(c.GTK_ORIENTATION_VERTICAL), 4);
+    const cs_lbl = c.gtk_label_new(gtk.s("控制台分辨率模式 (console-mode):"));
+    c.gtk_label_set_xalign(@ptrCast(cs_lbl), 0.0);
+    c.gtk_widget_add_css_class(@ptrCast(cs_lbl), gtk.s("entry-sub"));
+    c.gtk_box_append(@ptrCast(cs_box), @ptrCast(cs_lbl));
+
+    const cs_btn_box = c.gtk_box_new(@intCast(c.GTK_ORIENTATION_HORIZONTAL), 6);
+    const bc_max = c.gtk_button_new_with_label(gtk.s("最高分辨率 (max)"));
+    _ = c.g_signal_connect_data(@ptrCast(bc_max), gtk.s("clicked"), @ptrCast(&onLoaderConsoleMax), null, null, 0);
+    c.gtk_box_append(@ptrCast(cs_btn_box), bc_max);
+
+    const bc_keep = c.gtk_button_new_with_label(gtk.s("保持固件原样 (keep)"));
+    _ = c.g_signal_connect_data(@ptrCast(bc_keep), gtk.s("clicked"), @ptrCast(&onLoaderConsoleKeep), null, null, 0);
+    c.gtk_box_append(@ptrCast(cs_btn_box), bc_keep);
+
+    const bc_auto = c.gtk_button_new_with_label(gtk.s("自动检测 (auto)"));
+    _ = c.g_signal_connect_data(@ptrCast(bc_auto), gtk.s("clicked"), @ptrCast(&onLoaderConsoleAuto), null, null, 0);
+    c.gtk_box_append(@ptrCast(cs_btn_box), bc_auto);
+
+    c.gtk_box_append(@ptrCast(cs_box), @ptrCast(cs_btn_box));
+
+    const cs_entry = c.gtk_entry_new();
+    c.gtk_editable_set_text(@ptrCast(cs_entry), gtk.s(gtk.zstr(lcfg.console_mode)));
+    loader_console_entry = @ptrCast(cs_entry);
+    c.gtk_box_append(@ptrCast(cs_box), @ptrCast(cs_entry));
+    c.gtk_box_append(@ptrCast(global_card), @ptrCast(cs_box));
+
+    c.gtk_box_append(@ptrCast(content_box), @ptrCast(global_card));
+
+    // ── 分组 2: 内层条目列表 (/boot/loader/entries/*.conf) ──
+    const entries_hdr = c.gtk_label_new(gtk.s("📋 内层条目与内核参数 (/boot/loader/entries/)"));
+    c.gtk_label_set_xalign(@ptrCast(entries_hdr), 0.0);
+    c.gtk_widget_add_css_class(@ptrCast(entries_hdr), gtk.s("entry-title"));
+    c.gtk_box_append(@ptrCast(content_box), @ptrCast(entries_hdr));
+
+    loader_widget_count = 0;
+
+    for (lcfg.entries.items) |e| {
+        if (loader_widget_count >= loader_widget_pairs.len) break;
+
+        const entry_card = c.gtk_box_new(@intCast(c.GTK_ORIENTATION_VERTICAL), 6);
+        c.gtk_widget_add_css_class(@ptrCast(entry_card), gtk.s("card"));
+
+        // 标题行与徽章
+        const tr = c.gtk_box_new(@intCast(c.GTK_ORIENTATION_HORIZONTAL), 8);
+        const id_badge = c.gtk_label_new(gtk.s(gtk.zfmt("条目: {s}", .{e.id})));
+        c.gtk_widget_add_css_class(@ptrCast(id_badge), gtk.s("pill-badge"));
+        c.gtk_widget_add_css_class(@ptrCast(id_badge), gtk.s("badge-blue"));
+        c.gtk_box_append(@ptrCast(tr), @ptrCast(id_badge));
+
+        if (e.is_default) {
+            const def_badge = c.gtk_label_new(gtk.s("当前默认 ★"));
+            c.gtk_widget_add_css_class(@ptrCast(def_badge), gtk.s("pill-badge"));
+            c.gtk_widget_add_css_class(@ptrCast(def_badge), gtk.s("badge-green"));
+            c.gtk_box_append(@ptrCast(tr), @ptrCast(def_badge));
+        }
+
+        c.gtk_box_append(@ptrCast(entry_card), @ptrCast(tr));
+
+        // 标题编辑框
+        const t_lbl = c.gtk_label_new(gtk.s("引导显示标题 (Title):"));
+        c.gtk_label_set_xalign(@ptrCast(t_lbl), 0.0);
+        c.gtk_widget_add_css_class(@ptrCast(t_lbl), gtk.s("entry-sub"));
+        c.gtk_box_append(@ptrCast(entry_card), @ptrCast(t_lbl));
+
+        const t_entry = c.gtk_entry_new();
+        c.gtk_editable_set_text(@ptrCast(t_entry), gtk.s(gtk.zstr(e.title)));
+        c.gtk_box_append(@ptrCast(entry_card), @ptrCast(t_entry));
+
+        // 路径详情 (只读提示)
+        if (e.linux.len > 0) {
+            const lin_lbl = c.gtk_label_new(gtk.s(gtk.zfmt("内核镜像 (linux): {s}", .{e.linux})));
+            c.gtk_label_set_xalign(@ptrCast(lin_lbl), 0.0);
+            c.gtk_widget_add_css_class(@ptrCast(lin_lbl), gtk.s("entry-sub"));
+            c.gtk_box_append(@ptrCast(entry_card), @ptrCast(lin_lbl));
+        }
+        if (e.efi.len > 0) {
+            const efi_lbl = c.gtk_label_new(gtk.s(gtk.zfmt("EFI 镜像路径 (efi): {s}", .{e.efi})));
+            c.gtk_label_set_xalign(@ptrCast(efi_lbl), 0.0);
+            c.gtk_widget_add_css_class(@ptrCast(efi_lbl), gtk.s("entry-sub"));
+            c.gtk_box_append(@ptrCast(entry_card), @ptrCast(efi_lbl));
+        }
+
+        var opt_entry_ptr: ?*c.GtkEntry = null;
+
+        if (e.is_conf_file) {
+            // 内核命令行参数 (Options / Cmdline)
+            const opt_lbl = c.gtk_label_new(gtk.s("内核启动命令行参数 (Options / Cmdline):"));
+            c.gtk_label_set_xalign(@ptrCast(opt_lbl), 0.0);
+            c.gtk_widget_add_css_class(@ptrCast(opt_lbl), gtk.s("entry-sub"));
+            c.gtk_box_append(@ptrCast(entry_card), @ptrCast(opt_lbl));
+
+            const o_entry = c.gtk_entry_new();
+            c.gtk_editable_set_text(@ptrCast(o_entry), gtk.s(gtk.zstr(e.options)));
+            opt_entry_ptr = @ptrCast(o_entry);
+            c.gtk_box_append(@ptrCast(entry_card), @ptrCast(o_entry));
+        } else {
+            const uki_lbl = c.gtk_label_new(gtk.s("💡 提示: UKI 为一体化 EFI 镜像，内核启动参数与 initramfs 已固化在二进制节区中。"));
+            c.gtk_label_set_xalign(@ptrCast(uki_lbl), 0.0);
+            c.gtk_widget_add_css_class(@ptrCast(uki_lbl), gtk.s("entry-sub"));
+            c.gtk_box_append(@ptrCast(entry_card), @ptrCast(uki_lbl));
+        }
+
+        // 记录该条目的控件引用
+        var pair = &loader_widget_pairs[loader_widget_count];
+        const copy_len = @min(e.id.len, pair.id_buf.len);
+        @memcpy(pair.id_buf[0..copy_len], e.id[0..copy_len]);
+        pair.id_len = copy_len;
+        pair.title_entry = @ptrCast(t_entry);
+        pair.options_entry = opt_entry_ptr;
+        loader_widget_count += 1;
+
+        c.gtk_box_append(@ptrCast(content_box), @ptrCast(entry_card));
+    }
+
+    // ── 底部操作按钮 ──
+    const btn_row = c.gtk_box_new(@intCast(c.GTK_ORIENTATION_HORIZONTAL), 10);
+    c.gtk_widget_set_halign(@ptrCast(btn_row), @intCast(c.GTK_ALIGN_END));
+    c.gtk_widget_set_margin_top(@ptrCast(btn_row), 10);
+
+    const btn_cancel = c.gtk_button_new_with_label(gtk.s("取消"));
+    _ = c.g_signal_connect_data(@ptrCast(btn_cancel), gtk.s("clicked"), @ptrCast(&onCloseLoaderDialog), null, null, 0);
+    c.gtk_box_append(@ptrCast(btn_row), btn_cancel);
+
+    const btn_save = c.gtk_button_new_with_label(gtk.s("💾 确认保存并应用内层配置 (写入 /boot/loader)"));
+    c.gtk_widget_add_css_class(@ptrCast(btn_save), gtk.s("suggested-action"));
+    _ = c.g_signal_connect_data(@ptrCast(btn_save), gtk.s("clicked"), @ptrCast(&onSaveLoaderConfig), null, null, 0);
+    c.gtk_box_append(@ptrCast(btn_row), btn_save);
+
+    c.gtk_box_append(@ptrCast(content_box), @ptrCast(btn_row));
+
+    c.gtk_scrolled_window_set_child(@ptrCast(scrolled), @ptrCast(content_box));
+    c.gtk_window_set_child(@ptrCast(dialog), @ptrCast(scrolled));
+    c.gtk_window_present(@ptrCast(dialog));
+}
+
+fn onLoaderPresetZen(_: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
+    if (loader_default_entry) |e| c.gtk_editable_set_text(@ptrCast(e), gtk.s("arch-linux-zen.conf"));
+}
+
+fn onLoaderPresetWin(_: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
+    if (loader_default_entry) |e| c.gtk_editable_set_text(@ptrCast(e), gtk.s("windows.conf"));
+}
+
+fn onLoaderPresetUki(_: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
+    if (loader_default_entry) |e| c.gtk_editable_set_text(@ptrCast(e), gtk.s("arch-linux.efi"));
+}
+
+fn onLoaderTimeoutMenuForce(_: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
+    if (loader_timeout_entry) |e| c.gtk_editable_set_text(@ptrCast(e), gtk.s("menu-force"));
+}
+
+fn onLoaderTimeout3s(_: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
+    if (loader_timeout_entry) |e| c.gtk_editable_set_text(@ptrCast(e), gtk.s("3"));
+}
+
+fn onLoaderTimeout5s(_: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
+    if (loader_timeout_entry) |e| c.gtk_editable_set_text(@ptrCast(e), gtk.s("5"));
+}
+
+fn onLoaderTimeout0s(_: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
+    if (loader_timeout_entry) |e| c.gtk_editable_set_text(@ptrCast(e), gtk.s("0"));
+}
+
+fn onLoaderConsoleMax(_: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
+    if (loader_console_entry) |e| c.gtk_editable_set_text(@ptrCast(e), gtk.s("max"));
+}
+
+fn onLoaderConsoleKeep(_: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
+    if (loader_console_entry) |e| c.gtk_editable_set_text(@ptrCast(e), gtk.s("keep"));
+}
+
+fn onLoaderConsoleAuto(_: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
+    if (loader_console_entry) |e| c.gtk_editable_set_text(@ptrCast(e), gtk.s("auto"));
+}
+
+fn onCloseLoaderDialog(_: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
+    if (loader_dialog) |d| {
+        c.gtk_window_destroy(d);
+        loader_dialog = null;
+    }
+}
+
+fn onSaveLoaderConfig(_: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
+    const def_entry = std.mem.span(c.gtk_editable_get_text(@ptrCast(loader_default_entry.?)));
+    const timeout_val = std.mem.span(c.gtk_editable_get_text(@ptrCast(loader_timeout_entry.?)));
+    const console_val = std.mem.span(c.gtk_editable_get_text(@ptrCast(loader_console_entry.?)));
+
+    const res1 = sdboot.saveGlobalConf(state.io, state.gpa, def_entry, timeout_val, console_val) catch |err| {
+        showStatus(gtk.zfmt("[-] 保存全局配置失败: {s}", .{@errorName(err)}), true);
+        return;
+    };
+    defer res1.deinit(state.gpa);
+
+    if (!res1.ok()) {
+        showStatus(res1.stderr, true);
+        return;
+    }
+
+    var i: usize = 0;
+    while (i < loader_widget_count) : (i += 1) {
+        const pair = &loader_widget_pairs[i];
+        const id = pair.id_buf[0..pair.id_len];
+        const title = std.mem.span(c.gtk_editable_get_text(@ptrCast(pair.title_entry)));
+        const options = if (pair.options_entry) |oe| std.mem.span(c.gtk_editable_get_text(@ptrCast(oe))) else "";
+
+        const res_e = sdboot.saveEntryConfig(state.io, state.gpa, id, title, options) catch continue;
+        defer res_e.deinit(state.gpa);
+    }
+
+    onCloseLoaderDialog(@ptrCast(c.gtk_button_new()), null);
+    refreshData();
+    showStatus("✔ 成功保存并应用 systemd-boot 内层引导项与内核参数！", false);
 }

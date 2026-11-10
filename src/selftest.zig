@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const nvram = @import("nvram.zig");
+const loader = @import("loader.zig");
 const sys = @import("sys.zig");
 
 const SAMPLE_EFIBOOTMGR_OUTPUT =
@@ -32,7 +33,7 @@ pub fn run(init: std.process.Init) !u8 {
     std.debug.print("==================================================\n", .{});
 
     // 1. 测试解析
-    std.debug.print("[1/5] 测试 efibootmgr -v 输出解析器...", .{});
+    std.debug.print("[1/6] 测试 efibootmgr -v 输出解析器...", .{});
     var cfg = try nvram.parseOutput(allocator, SAMPLE_EFIBOOTMGR_OUTPUT);
     defer cfg.deinit(allocator);
 
@@ -83,7 +84,7 @@ pub fn run(init: std.process.Init) !u8 {
     std.debug.print(" [OK]\n", .{});
 
     // 2. 测试去重与幽灵过滤
-    std.debug.print("[2/5] 测试 BootOrder 自动去重与幽灵条目过滤算法...", .{});
+    std.debug.print("[2/6] 测试 BootOrder 自动去重与幽灵条目过滤算法...", .{});
     var dedup_order = try cfg.getDeduplicatedOrder(allocator);
     defer dedup_order.deinit(allocator);
 
@@ -101,7 +102,7 @@ pub fn run(init: std.process.Init) !u8 {
     std.debug.print(" [OK]\n", .{});
 
     // 3. 测试首选项置顶算法
-    std.debug.print("[3/5] 测试首选启动项置顶调整...", .{});
+    std.debug.print("[3/6] 测试首选启动项置顶调整...", .{});
     var new_order = std.ArrayList([4]u8).empty;
     defer new_order.deinit(allocator);
     // 把 0005 置顶
@@ -120,7 +121,7 @@ pub fn run(init: std.process.Init) !u8 {
     std.debug.print(" [OK]\n", .{});
 
     // 4. 测试设备路径 ESP 分区号解析算法
-    std.debug.print("[4/5] 测试设备路径 ESP 分区号解析算法...", .{});
+    std.debug.print("[4/6] 测试设备路径 ESP 分区号解析算法...", .{});
     const p5 = nvram.parsePartition("HD(5,GPT,3833dd23-333d-4cde-b586-07884557ed87,0x30042000,0x1e8800)");
     if (p5 != 5) {
         std.debug.print("\n[FAIL] 分区号解析错误: 期望 5，实际 {d}\n", .{p5});
@@ -134,14 +135,70 @@ pub fn run(init: std.process.Init) !u8 {
     std.debug.print(" [OK]\n", .{});
 
     // 5. 测试系统权限与 efibootmgr 可用性探针
-    std.debug.print("[5/5] 测试真实系统 efibootmgr 命令探针...", .{});
-    // 检查 efibootmgr 二进制是否存在
+    std.debug.print("[5/6] 测试真实系统 efibootmgr 命令探针...", .{});
     const probe_res = sys.run(io, allocator, &.{ "efibootmgr", "-v" }) catch |err| {
         std.debug.print("\n[WARN] 无法启动 efibootmgr 进程: {s} (非 UEFI 环境可能跳过)\n", .{@errorName(err)});
         return 0;
     };
     defer probe_res.deinit(allocator);
     std.debug.print(" [OK] (系统存在 efibootmgr 命令)\n", .{});
+
+    // 6. 测试 systemd-boot 内层引导配置与条目解析器
+    std.debug.print("[6/6] 测试 systemd-boot 内层引导配置与条目解析器...", .{});
+    const sample_loader_conf =
+        "default arch-linux-zen.conf\n" ++
+        "timeout menu-force\n" ++
+        "console-mode max\n";
+    const sample_entries = [_]loader.MockEntry{
+        .{
+            .id = "arch-linux-zen.conf",
+            .content =
+            "title   Arch Linux (Zen 优化内核)\n" ++
+                "linux   /vmlinuz-linux-zen\n" ++
+                "options root=PARTUUID=1bbbc75a rw rootfstype=ext4\n",
+        },
+        .{
+            .id = "windows.conf",
+            .content =
+            "title   Windows 11\n" ++
+                "efi     /EFI/Microsoft/Boot/bootmgfw.efi\n",
+        },
+    };
+
+    var lcfg = try loader.parseFromText(allocator, sample_loader_conf, &sample_entries);
+    defer lcfg.deinit(allocator);
+
+    if (!std.mem.eql(u8, lcfg.default_entry, "arch-linux-zen.conf")) {
+        std.debug.print("\n[FAIL] 默认条目解析错误: 期望 arch-linux-zen.conf，实际 {s}\n", .{lcfg.default_entry});
+        return 1;
+    }
+    if (!std.mem.eql(u8, lcfg.timeout, "menu-force")) {
+        std.debug.print("\n[FAIL] 超时设置解析错误: 期望 menu-force，实际 {s}\n", .{lcfg.timeout});
+        return 1;
+    }
+    if (!std.mem.eql(u8, lcfg.console_mode, "max")) {
+        std.debug.print("\n[FAIL] 控制台模式解析错误: 期望 max，实际 {s}\n", .{lcfg.console_mode});
+        return 1;
+    }
+    if (lcfg.entries.items.len != 2) {
+        std.debug.print("\n[FAIL] 条目解析数量错误: 期望 2，实际 {d}\n", .{lcfg.entries.items.len});
+        return 1;
+    }
+    const e1 = lcfg.findEntry("arch-linux-zen.conf");
+    if (e1 == null or !e1.?.is_default) {
+        std.debug.print("\n[FAIL] e1 条目或默认标志错误\n", .{});
+        return 1;
+    }
+    if (!std.mem.eql(u8, e1.?.title, "Arch Linux (Zen 优化内核)")) {
+        std.debug.print("\n[FAIL] e1 标题错误: {s}\n", .{e1.?.title});
+        return 1;
+    }
+    const e2 = lcfg.findEntry("windows.conf");
+    if (e2 == null or e2.?.is_default) {
+        std.debug.print("\n[FAIL] e2 条目或默认标志错误\n", .{});
+        return 1;
+    }
+    std.debug.print(" [OK]\n", .{});
 
     std.debug.print("--------------------------------------------------\n", .{});
     std.debug.print("✔ 内建全链路自检全部通过！(数据准确、算法无误、交付即自证可用)\n", .{});

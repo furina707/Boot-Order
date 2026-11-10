@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const nvram = @import("nvram.zig");
+const loader = @import("loader.zig");
 const ui = @import("ui.zig");
 pub const selftest = @import("selftest.zig");
 
@@ -183,7 +184,7 @@ pub fn main(init: std.process.Init) !u8 {
             }
 
             var label: []const u8 = existing.?.title;
-            var loader: []const u8 = existing.?.path;
+            var loader_path: []const u8 = existing.?.path;
             var disk: []const u8 = "/dev/nvme0n1";
             var part: u32 = nvram.parsePartition(existing.?.device_path);
             var active: bool = existing.?.active;
@@ -195,7 +196,7 @@ pub fn main(init: std.process.Init) !u8 {
                     label = argv[i];
                 } else if (std.mem.eql(u8, argv[i], "--loader") and i + 1 < argv.len) {
                     i += 1;
-                    loader = argv[i];
+                    loader_path = argv[i];
                 } else if (std.mem.eql(u8, argv[i], "--disk") and i + 1 < argv.len) {
                     i += 1;
                     disk = argv[i];
@@ -208,11 +209,129 @@ pub fn main(init: std.process.Init) !u8 {
                 }
             }
 
-            const res = try nvram.editEntry(io, allocator, cfg, id, disk, part, label, loader, active);
+            const res = try nvram.editEntry(io, allocator, cfg, id, disk, part, label, loader_path, active);
             defer res.deinit(allocator);
 
             if (res.ok()) {
-                std.debug.print("[✔] 成功更新启动项 Boot{s}！(标签: '{s}', 路径: '{s}', 分区: {d})\n", .{ id, label, loader, part });
+                std.debug.print("[✔] 成功更新启动项 Boot{s}！(标签: '{s}', 路径: '{s}', 分区: {d})\n", .{ id, label, loader_path, part });
+                return 0;
+            } else {
+                std.debug.print("[-] 失败: {s}\n", .{res.stderr});
+                return 1;
+            }
+        }
+
+        // 9. 查看 systemd-boot 内层引导配置与条目 (--loader-list / -ll)
+        if (std.mem.eql(u8, sub, "--loader-list") or std.mem.eql(u8, sub, "-ll")) {
+            var lcfg = try loader.loadConfig(io, allocator);
+            defer lcfg.deinit(allocator);
+
+            std.debug.print("================================================================================\n", .{});
+            std.debug.print("           Linux Boot Manager (systemd-boot) 内层引导与内核配置\n", .{});
+            std.debug.print("================================================================================\n", .{});
+            std.debug.print("默认条目 (default):     {s}\n", .{lcfg.default_entry});
+            std.debug.print("菜单倒计时 (timeout):   {s}\n", .{lcfg.timeout});
+            std.debug.print("控制台模式 (console):   {s}\n", .{lcfg.console_mode});
+            std.debug.print("--------------------------------------------------------------------------------\n", .{});
+
+            for (lcfg.entries.items, 0..) |e, idx| {
+                const def_tag = if (e.is_default) " [★ 默认项]" else "";
+                std.debug.print("  #{d:<2} 条目: {s:<24}{s}\n", .{ idx + 1, e.id, def_tag });
+                std.debug.print("      标题: {s}\n", .{e.title});
+                if (e.linux.len > 0) std.debug.print("      内核: {s}\n", .{e.linux});
+                if (e.efi.len > 0) std.debug.print("      EFI : {s}\n", .{e.efi});
+                if (e.options.len > 0) std.debug.print("      参数: {s}\n", .{e.options});
+                std.debug.print("\n", .{});
+            }
+            std.debug.print("================================================================================\n", .{});
+            return 0;
+        }
+
+        // 10. 设置内层默认启动项 (--set-loader-default <ENTRY_ID>)
+        if (std.mem.eql(u8, sub, "--set-loader-default") and argv.len > 2) {
+            const entry_id = argv[2];
+            var lcfg = try loader.loadConfig(io, allocator);
+            defer lcfg.deinit(allocator);
+
+            const res = try loader.saveGlobalConf(io, allocator, entry_id, lcfg.timeout, lcfg.console_mode);
+            defer res.deinit(allocator);
+
+            if (res.ok()) {
+                std.debug.print("[✔] 成功将 systemd-boot 默认启动项设置为 '{s}'！(已写入 /boot/loader/loader.conf)\n", .{entry_id});
+                return 0;
+            } else {
+                std.debug.print("[-] 失败: {s}\n", .{res.stderr});
+                return 1;
+            }
+        }
+
+        // 11. 设置内层超时时间 (--set-loader-timeout <VAL>)
+        if (std.mem.eql(u8, sub, "--set-loader-timeout") and argv.len > 2) {
+            const timeout_val = argv[2];
+            var lcfg = try loader.loadConfig(io, allocator);
+            defer lcfg.deinit(allocator);
+
+            const res = try loader.saveGlobalConf(io, allocator, lcfg.default_entry, timeout_val, lcfg.console_mode);
+            defer res.deinit(allocator);
+
+            if (res.ok()) {
+                std.debug.print("[✔] 成功将 systemd-boot 引导倒计时设置为 '{s}'！\n", .{timeout_val});
+                return 0;
+            } else {
+                std.debug.print("[-] 失败: {s}\n", .{res.stderr});
+                return 1;
+            }
+        }
+
+        // 12. 设置内核启动参数 (--set-options <ENTRY_ID> "<OPTIONS>")
+        if (std.mem.eql(u8, sub, "--set-options") and argv.len > 3) {
+            const entry_id = argv[2];
+            const new_options = argv[3];
+
+            var lcfg = try loader.loadConfig(io, allocator);
+            defer lcfg.deinit(allocator);
+
+            const existing = lcfg.findEntry(entry_id);
+            const title = if (existing) |e| e.title else entry_id;
+
+            const res = try loader.saveEntryConfig(io, allocator, entry_id, title, new_options);
+            defer res.deinit(allocator);
+
+            if (res.ok()) {
+                std.debug.print("[✔] 成功更新条目 '{s}' 的内核命令行参数！\n", .{entry_id});
+                return 0;
+            } else {
+                std.debug.print("[-] 失败: {s}\n", .{res.stderr});
+                return 1;
+            }
+        }
+
+        // 13. 编辑内层条目标题与参数 (--loader-edit <ENTRY_ID> [--title <TITLE>] [--options <OPTIONS>])
+        if (std.mem.eql(u8, sub, "--loader-edit") and argv.len > 2) {
+            const entry_id = argv[2];
+            var lcfg = try loader.loadConfig(io, allocator);
+            defer lcfg.deinit(allocator);
+
+            const existing = lcfg.findEntry(entry_id);
+            var title: []const u8 = if (existing) |e| e.title else entry_id;
+            var options: []const u8 = if (existing) |e| e.options else "";
+
+            var i: usize = 3;
+            while (i < argv.len) : (i += 1) {
+                if (std.mem.eql(u8, argv[i], "--title") and i + 1 < argv.len) {
+                    i += 1;
+                    title = argv[i];
+                } else if (std.mem.eql(u8, argv[i], "--options") and i + 1 < argv.len) {
+                    i += 1;
+                    options = argv[i];
+                }
+            }
+
+            const res = try loader.saveEntryConfig(io, allocator, entry_id, title, options);
+            defer res.deinit(allocator);
+
+            if (res.ok()) {
+                std.debug.print("[✔] 成功更新内层条目 '{s}'！(标题: '{s}')\n", .{ entry_id, title });
                 return 0;
             } else {
                 std.debug.print("[-] 失败: {s}\n", .{res.stderr});
@@ -232,15 +351,20 @@ fn printHelp() void {
         \\================================================================================
         \\
         \\用法:
-        \\  python run.py                   启动原生 GTK4 高清图形界面 (默认)
-        \\  python run.py selftest          运行内建全链路功能自检
-        \\  python run.py --list            查看当前 NVRAM 全部启动项与顺序 (CLI)
-        \\  python run.py --set-default <ID> 快速将指定条目设为第一启动项 (例如 0002)
-        \\  python run.py --set-next <ID>    设置下次开机单次启动项 (BootNext)
-        \\  python run.py --edit <ID> [...]  编辑现有启动项 (支持修改标签/路径/分区/状态)
-        \\  python run.py --set-timeout <秒> 设置固件引导倒计时超时时间
-        \\  python run.py --dedup           自动清理 BootOrder 重复项
-        \\  python run.py -h, --help        显示本帮助
+        \\  python run.py                     启动原生 GTK4 高清图形界面 (默认)
+        \\  python run.py selftest            运行内建全链路功能自检
+        \\  python run.py --list              查看当前 NVRAM 全部启动项与顺序 (CLI)
+        \\  python run.py --set-default <ID>  快速将指定条目设为第一启动项 (例如 0002)
+        \\  python run.py --set-next <ID>     设置下次开机单次启动项 (BootNext)
+        \\  python run.py --edit <ID> [...]   编辑现有启动项 (支持修改标签/路径/分区/状态)
+        \\  python run.py --set-timeout <秒>  设置固件引导倒计时超时时间
+        \\  python run.py --dedup             自动清理 BootOrder 重复项
+        \\  python run.py --loader-list       查看 systemd-boot 内层引导项与内核配置
+        \\  python run.py --set-loader-default <ID> 设置内层默认启动条目 (例如 arch-linux-zen.conf)
+        \\  python run.py --set-loader-timeout <秒> 设置内层菜单倒计时 (例如 menu-force 或 3)
+        \\  python run.py --set-options <ID> "<参数>" 设置指定内核条目的启动参数 (cmdline)
+        \\  python run.py --loader-edit <ID> [...] 编辑内层条目标题与参数
+        \\  python run.py -h, --help          显示本帮助
         \\
         \\编辑参数 (配合 --edit 使用):
         \\  --label <名称>     设置启动项显示名称 (例如 "Linux Boot Manager")
@@ -248,6 +372,10 @@ fn printHelp() void {
         \\  --part <分区号>    设置目标 ESP 分区号 (例如 5)
         \\  --disk <磁盘设备>  设置磁盘设备路径 (默认 /dev/nvme0n1)
         \\  --active <0|1>     启用或禁用该条目
+        \\
+        \\内层参数 (配合 --loader-edit 使用):
+        \\  --title <标题>     设置引导项显示标题
+        \\  --options <参数>   设置内核启动参数 (cmdline)
         \\
         \\核心特性:
         \\  - Zig 0.17+ 原生机器码、Zero Runtime，单二进制独立交付；

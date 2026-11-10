@@ -23,6 +23,11 @@
     python run.py --edit ID [...]   编辑启动项 (例如: python run.py --edit 0002 --label "Linux")
     python run.py --set-timeout SEC 设置固件引导倒计时超时时间
     python run.py --dedup           自动清理 BootOrder 重复项
+    python run.py --loader-list     查看 systemd-boot 内层引导项与内核配置
+    python run.py --set-loader-default ID 设置内层默认条目 (例如 arch-linux-zen.conf)
+    python run.py --set-loader-timeout SEC 设置内层菜单倒计时 (例如 menu-force 或 3)
+    python run.py --set-options ID "参数" 设置指定内核条目的启动参数 (cmdline)
+    python run.py --loader-edit ID [...] 编辑内层条目标题与参数
     python run.py --build-only      仅编译 Zig 二进制，不启动
     python run.py -h, --help        显示帮助
 
