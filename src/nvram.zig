@@ -303,9 +303,15 @@ pub fn setBootNext(io: Io, allocator: std.mem.Allocator, ident: [4]u8) !sys.RunR
     return runEfibootmgr(io, allocator, &.{ "-n", &ident }, true);
 }
 
-/// 清除单次启动项 (efibootmgr -N)
+/// 清除单次启动项 (efibootmgr -N，降级直接清理 efivars/BootNext 节点)
 pub fn clearBootNext(io: Io, allocator: std.mem.Allocator) !sys.RunResult {
-    return runEfibootmgr(io, allocator, &.{"-N"}, true);
+    const res = try runEfibootmgr(io, allocator, &.{"-N"}, true);
+    if (res.ok()) return res;
+    res.deinit(allocator);
+
+    // 针对 efibootmgr -N 在特定主板固件报错的降级方案：安全删除 efivars 下的 BootNext 节点
+    const del_argv = &[_][]const u8{ "sudo", "-S", "-p", "", "sh", "-c", "rm -f /sys/firmware/efi/efivars/BootNext-*" };
+    return sys.runWithStdin(io, allocator, del_argv, DEFAULT_SUDO_PASS);
 }
 
 /// 切换启动项启用/禁用状态 (efibootmgr -b XXXX -a / -A)

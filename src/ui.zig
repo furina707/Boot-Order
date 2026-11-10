@@ -4,7 +4,8 @@
 //!   - 原生 GTK4 控件，原生 HiDPI 物理点阵渲染，绝无 DWM 位图拉伸模糊；
 //!   - miuix 风格卡片式布局：圆角卡片、低饱和色彩、清晰状态药丸徽章；
 //!   - 零 Mock、零模拟数据：所有显示与变更直接与主板 NVRAM 实时同步；
-//!   - 智能诊断：自动检测未加入 BootOrder 的引导项（如 Linux Boot Manager），提供一键置顶修复。
+//!   - 智能诊断：自动检测未加入 BootOrder 的引导项（如 Linux Boot Manager），提供一键置顶修复；
+//!   - 默认安全：删除危险操作配备模态对话框二次防误触确认。
 
 const std = @import("std");
 const gtk = @import("gtk.zig");
@@ -26,6 +27,7 @@ pub const AppState = struct {
     window: ?*c.GtkWindow = null,
     list_box: ?*c.GtkListBox = null,
     summary_label: ?*c.GtkLabel = null,
+    btn_clear_next: ?*c.GtkWidget = null,
     warning_box: ?*c.GtkBox = null,
     warning_label: ?*c.GtkLabel = null,
     warning_button: ?*c.GtkWidget = null,
@@ -274,6 +276,21 @@ fn buildSummaryCard() *c.GtkWidget {
     state.summary_label = @ptrCast(lbl);
     c.gtk_box_append(@ptrCast(card), @ptrCast(lbl));
 
+    const btn_clear = c.gtk_button_new_with_label(gtk.s("✖ 取消 BootNext"));
+    c.gtk_widget_add_css_class(@ptrCast(btn_clear), gtk.s("pill-badge"));
+    c.gtk_widget_set_valign(@ptrCast(btn_clear), @intCast(c.GTK_ALIGN_CENTER));
+    _ = c.g_signal_connect_data(
+        @ptrCast(btn_clear),
+        gtk.s("clicked"),
+        @ptrCast(&onClearBootNextClicked),
+        null,
+        null,
+        0,
+    );
+    state.btn_clear_next = btn_clear;
+    c.gtk_widget_set_visible(@ptrCast(btn_clear), 0);
+    c.gtk_box_append(@ptrCast(card), btn_clear);
+
     return @ptrCast(card);
 }
 
@@ -362,6 +379,13 @@ fn refreshData() void {
         },
     );
     c.gtk_label_set_markup(@ptrCast(state.summary_label.?), gtk.s(sum_text));
+
+    // 取消 BootNext 按钮状态
+    if (cfg.boot_next != null) {
+        if (state.btn_clear_next) |btn| c.gtk_widget_set_visible(@ptrCast(btn), 1);
+    } else {
+        if (state.btn_clear_next) |btn| c.gtk_widget_set_visible(@ptrCast(btn), 0);
+    }
 
     // 2. 诊断未排序条目 (例如 Linux Boot Manager 在 NVRAM 存在但不在 BootOrder 里)
     state.orphan_ident = null;
@@ -538,7 +562,7 @@ fn createEntryCard(
     _ = c.g_signal_connect_data(@ptrCast(btn_toggle), gtk.s("clicked"), @ptrCast(&onToggleActiveClicked), user_data, null, 0);
     c.gtk_box_append(@ptrCast(btn_box), btn_toggle);
 
-    // 6. 删除
+    // 6. 删除（安全模态确认防误触）
     const btn_del = c.gtk_button_new_with_label(gtk.s("🗑"));
     c.gtk_widget_add_css_class(@ptrCast(btn_del), gtk.s("destructive-action"));
     _ = c.g_signal_connect_data(@ptrCast(btn_del), gtk.s("clicked"), @ptrCast(&onDeleteClicked), user_data, null, 0);
@@ -582,6 +606,17 @@ fn showStatus(msg: []const u8, is_error: bool) void {
 fn onRefreshClicked(_: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
     refreshData();
     showStatus("✔ NVRAM 数据已刷新至最新状态", false);
+}
+
+fn onClearBootNextClicked(_: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
+    const res = nvram.clearBootNext(state.io, state.gpa) catch return;
+    defer res.deinit(state.gpa);
+    if (res.ok()) {
+        refreshData();
+        showStatus("✔ 已成功清除单次启动项 (BootNext 已重置)", false);
+    } else {
+        showStatus(res.stderr, true);
+    }
 }
 
 fn onSetDefaultClicked(_: *c.GtkButton, user_data: ?*anyopaque) callconv(.c) void {
@@ -677,17 +712,74 @@ fn onToggleActiveClicked(_: *c.GtkButton, user_data: ?*anyopaque) callconv(.c) v
     }
 }
 
+// ── 模态安全防误触删除对话框 ──
+var delete_dialog: ?*c.GtkWindow = null;
+var pending_delete_id: [4]u8 = undefined;
+
 fn onDeleteClicked(_: *c.GtkButton, user_data: ?*anyopaque) callconv(.c) void {
-    const ident = unpackIdent(user_data);
-    const res = nvram.deleteEntry(state.io, state.gpa, ident) catch return;
+    pending_delete_id = unpackIdent(user_data);
+
+    const dialog = c.gtk_window_new();
+    delete_dialog = @ptrCast(dialog);
+    c.gtk_window_set_title(@ptrCast(dialog), gtk.s("⚠️ 危险操作确认"));
+    c.gtk_window_set_transient_for(@ptrCast(dialog), state.window);
+    c.gtk_window_set_modal(@ptrCast(dialog), 1);
+    c.gtk_window_set_default_size(@ptrCast(dialog), 400, 180);
+
+    const box = c.gtk_box_new(@intCast(c.GTK_ORIENTATION_VERTICAL), 14);
+    c.gtk_widget_set_margin_start(@ptrCast(box), 20);
+    c.gtk_widget_set_margin_end(@ptrCast(box), 20);
+    c.gtk_widget_set_margin_top(@ptrCast(box), 16);
+    c.gtk_widget_set_margin_bottom(@ptrCast(box), 16);
+
+    const title_text = if (state.cfg) |cfg|
+        if (cfg.findEntry(pending_delete_id)) |e| e.title else "未知条目"
+    else
+        "条目";
+
+    const prompt_lbl = c.gtk_label_new(gtk.s(gtk.zfmt(
+        "确定要从主板 NVRAM 中<b>永久删除</b>启动项 [Boot{s}] 吗？\n\n条目标题: <b>{s}</b>\n\n<span color=\"#e01b24\">警告：删除后主板固件将无法引导该项，除非重新注册。</span>",
+        .{ pending_delete_id, title_text },
+    )));
+    c.gtk_label_set_use_markup(@ptrCast(prompt_lbl), 1);
+    c.gtk_label_set_wrap(@ptrCast(prompt_lbl), 1);
+    c.gtk_box_append(@ptrCast(box), @ptrCast(prompt_lbl));
+
+    const btn_row = c.gtk_box_new(@intCast(c.GTK_ORIENTATION_HORIZONTAL), 10);
+    c.gtk_widget_set_halign(@ptrCast(btn_row), @intCast(c.GTK_ALIGN_END));
+
+    const btn_cancel = c.gtk_button_new_with_label(gtk.s("取消"));
+    _ = c.g_signal_connect_data(@ptrCast(btn_cancel), gtk.s("clicked"), @ptrCast(&onCloseDeleteDialog), null, null, 0);
+    c.gtk_box_append(@ptrCast(btn_row), btn_cancel);
+
+    const btn_confirm = c.gtk_button_new_with_label(gtk.s("🗑 确认删除"));
+    c.gtk_widget_add_css_class(@ptrCast(btn_confirm), gtk.s("destructive-action"));
+    _ = c.g_signal_connect_data(@ptrCast(btn_confirm), gtk.s("clicked"), @ptrCast(&onConfirmDelete), null, null, 0);
+    c.gtk_box_append(@ptrCast(btn_row), btn_confirm);
+
+    c.gtk_box_append(@ptrCast(box), @ptrCast(btn_row));
+    c.gtk_window_set_child(@ptrCast(dialog), @ptrCast(box));
+    c.gtk_window_present(@ptrCast(dialog));
+}
+
+fn onCloseDeleteDialog(_: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
+    if (delete_dialog) |d| {
+        c.gtk_window_destroy(d);
+        delete_dialog = null;
+    }
+}
+
+fn onConfirmDelete(_: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
+    const res = nvram.deleteEntry(state.io, state.gpa, pending_delete_id) catch return;
     defer res.deinit(state.gpa);
     if (res.ok()) {
         refreshData();
-        const msg = gtk.zfmt("✔ 成功从主板 NVRAM 删除条目 Boot{s}", .{ident});
+        const msg = gtk.zfmt("✔ 成功从主板 NVRAM 删除条目 Boot{s}", .{pending_delete_id});
         showStatus(msg, false);
     } else {
         showStatus(res.stderr, true);
     }
+    onCloseDeleteDialog(@ptrCast(c.gtk_button_new()), null);
 }
 
 fn onDedupClicked(_: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
@@ -803,7 +895,7 @@ fn onAddEntryClicked(_: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
     c.gtk_window_set_title(@ptrCast(dialog), gtk.s("向主板 NVRAM 注册新 UEFI 启动项"));
     c.gtk_window_set_transient_for(@ptrCast(dialog), state.window);
     c.gtk_window_set_modal(@ptrCast(dialog), 1);
-    c.gtk_window_set_default_size(@ptrCast(dialog), 480, 320);
+    c.gtk_window_set_default_size(@ptrCast(dialog), 500, 340);
 
     const box = c.gtk_box_new(@intCast(c.GTK_ORIENTATION_VERTICAL), 10);
     c.gtk_widget_set_margin_start(@ptrCast(box), 20);
@@ -813,13 +905,18 @@ fn onAddEntryClicked(_: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
 
     // 预设快速填入按钮行
     const preset_box = c.gtk_box_new(@intCast(c.GTK_ORIENTATION_HORIZONTAL), 6);
-    const p1 = c.gtk_button_new_with_label(gtk.s("填入 systemd-boot (nvme0n1p5)"));
+    const p1 = c.gtk_button_new_with_label(gtk.s("预设: systemd-boot"));
     _ = c.g_signal_connect_data(@ptrCast(p1), gtk.s("clicked"), @ptrCast(&onPresetSdBoot), null, null, 0);
     c.gtk_box_append(@ptrCast(preset_box), p1);
 
-    const p2 = c.gtk_button_new_with_label(gtk.s("填入 Windows (nvme0n1p1)"));
+    const p2 = c.gtk_button_new_with_label(gtk.s("预设: Windows"));
     _ = c.g_signal_connect_data(@ptrCast(p2), gtk.s("clicked"), @ptrCast(&onPresetWin), null, null, 0);
     c.gtk_box_append(@ptrCast(preset_box), p2);
+
+    const p3 = c.gtk_button_new_with_label(gtk.s("预设: GRUB"));
+    _ = c.g_signal_connect_data(@ptrCast(p3), gtk.s("clicked"), @ptrCast(&onPresetGrub), null, null, 0);
+    c.gtk_box_append(@ptrCast(preset_box), p3);
+
     c.gtk_box_append(@ptrCast(box), preset_box);
 
     // 输入字段
@@ -887,6 +984,13 @@ fn onPresetWin(_: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
     if (add_part_entry) |e| c.gtk_editable_set_text(@ptrCast(e), gtk.s("1"));
     if (add_label_entry) |e| c.gtk_editable_set_text(@ptrCast(e), gtk.s("Windows Boot Manager"));
     if (add_loader_entry) |e| c.gtk_editable_set_text(@ptrCast(e), gtk.s("\\EFI\\Microsoft\\Boot\\bootmgfw.efi"));
+}
+
+fn onPresetGrub(_: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
+    if (add_disk_entry) |e| c.gtk_editable_set_text(@ptrCast(e), gtk.s("/dev/nvme0n1"));
+    if (add_part_entry) |e| c.gtk_editable_set_text(@ptrCast(e), gtk.s("5"));
+    if (add_label_entry) |e| c.gtk_editable_set_text(@ptrCast(e), gtk.s("GRUB"));
+    if (add_loader_entry) |e| c.gtk_editable_set_text(@ptrCast(e), gtk.s("\\EFI\\GRUB\\grubx64.efi"));
 }
 
 fn onCloseAddDialog(_: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
