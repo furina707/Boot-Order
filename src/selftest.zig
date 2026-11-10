@@ -155,6 +155,7 @@ pub fn run(init: std.process.Init) !u8 {
             .content =
             "title   Arch Linux (Zen 优化内核)\n" ++
                 "linux   /vmlinuz-linux-zen\n" ++
+                "sort-key 01-zen\n" ++
                 "options root=PARTUUID=1bbbc75a rw rootfstype=ext4\n",
         },
         .{
@@ -191,6 +192,10 @@ pub fn run(init: std.process.Init) !u8 {
     }
     if (!std.mem.eql(u8, e1.?.title, "Arch Linux (Zen 优化内核)")) {
         std.debug.print("\n[FAIL] e1 标题错误: {s}\n", .{e1.?.title});
+        return 1;
+    }
+    if (!std.mem.eql(u8, e1.?.sort_key, "01-zen")) {
+        std.debug.print("\n[FAIL] e1 排序键解析错误: 期望 01-zen，实际 {s}\n", .{e1.?.sort_key});
         return 1;
     }
     const e2 = lcfg.findEntry("windows.conf");

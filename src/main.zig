@@ -238,6 +238,7 @@ pub fn main(init: std.process.Init) !u8 {
                 const def_tag = if (e.is_default) " [★ 默认项]" else "";
                 std.debug.print("  #{d:<2} 条目: {s:<24}{s}\n", .{ idx + 1, e.id, def_tag });
                 std.debug.print("      标题: {s}\n", .{e.title});
+                if (e.sort_key.len > 0) std.debug.print("      排序: {s} (sort-key)\n", .{e.sort_key});
                 if (e.linux.len > 0) std.debug.print("      内核: {s}\n", .{e.linux});
                 if (e.efi.len > 0) std.debug.print("      EFI : {s}\n", .{e.efi});
                 if (e.options.len > 0) std.debug.print("      参数: {s}\n", .{e.options});
@@ -294,7 +295,7 @@ pub fn main(init: std.process.Init) !u8 {
             const existing = lcfg.findEntry(entry_id);
             const title = if (existing) |e| e.title else entry_id;
 
-            const res = try loader.saveEntryConfig(io, allocator, entry_id, title, new_options);
+            const res = try loader.saveEntryConfig(io, allocator, entry_id, title, new_options, null);
             defer res.deinit(allocator);
 
             if (res.ok()) {
@@ -306,7 +307,7 @@ pub fn main(init: std.process.Init) !u8 {
             }
         }
 
-        // 13. 编辑内层条目标题与参数 (--loader-edit <ENTRY_ID> [--title <TITLE>] [--options <OPTIONS>])
+        // 13. 编辑内层条目标题与参数 (--loader-edit <ENTRY_ID> [--title <TITLE>] [--options <OPTIONS>] [--sort-key <KEY>])
         if (std.mem.eql(u8, sub, "--loader-edit") and argv.len > 2) {
             const entry_id = argv[2];
             var lcfg = try loader.loadConfig(io, allocator);
@@ -315,6 +316,7 @@ pub fn main(init: std.process.Init) !u8 {
             const existing = lcfg.findEntry(entry_id);
             var title: []const u8 = if (existing) |e| e.title else entry_id;
             var options: []const u8 = if (existing) |e| e.options else "";
+            var sort_key: ?[]const u8 = null;
 
             var i: usize = 3;
             while (i < argv.len) : (i += 1) {
@@ -324,14 +326,64 @@ pub fn main(init: std.process.Init) !u8 {
                 } else if (std.mem.eql(u8, argv[i], "--options") and i + 1 < argv.len) {
                     i += 1;
                     options = argv[i];
+                } else if (std.mem.eql(u8, argv[i], "--sort-key") and i + 1 < argv.len) {
+                    i += 1;
+                    sort_key = argv[i];
                 }
             }
 
-            const res = try loader.saveEntryConfig(io, allocator, entry_id, title, options);
+            const res = try loader.saveEntryConfig(io, allocator, entry_id, title, options, sort_key);
             defer res.deinit(allocator);
 
             if (res.ok()) {
                 std.debug.print("[✔] 成功更新内层条目 '{s}'！(标题: '{s}')\n", .{ entry_id, title });
+                return 0;
+            } else {
+                std.debug.print("[-] 失败: {s}\n", .{res.stderr});
+                return 1;
+            }
+        }
+
+        // 14. 调整内层条目排位顺位 (--loader-move <FROM_IDX> <TO_IDX>)
+        if (std.mem.eql(u8, sub, "--loader-move") and argv.len > 3) {
+            const from_idx = std.fmt.parseInt(usize, argv[2], 10) catch {
+                std.debug.print("[-] 错误: 源顺位必须为有效正整数 (例如 1)\n", .{});
+                return 1;
+            };
+            const to_idx = std.fmt.parseInt(usize, argv[3], 10) catch {
+                std.debug.print("[-] 错误: 目标顺位必须为有效正整数 (例如 2)\n", .{});
+                return 1;
+            };
+            if (from_idx == 0 or to_idx == 0) {
+                std.debug.print("[-] 错误: 顺位编号必须从 1 开始\n", .{});
+                return 1;
+            }
+
+            var lcfg = try loader.loadConfig(io, allocator);
+            defer lcfg.deinit(allocator);
+
+            const res = try loader.moveLoaderEntry(io, allocator, lcfg, from_idx - 1, to_idx - 1);
+            defer res.deinit(allocator);
+
+            if (res.ok()) {
+                std.debug.print("[✔] 成功将内层条目从顺位 #{d} 移动到顺位 #{d}！(已更新 sort-key 菜单排序)\n", .{ from_idx, to_idx });
+                return 0;
+            } else {
+                std.debug.print("[-] 失败: {s}\n", .{res.stderr});
+                return 1;
+            }
+        }
+
+        // 15. 设置内层条目排序权重 (--loader-sort-key <ENTRY_ID> <KEY>)
+        if (std.mem.eql(u8, sub, "--loader-sort-key") and argv.len > 3) {
+            const entry_id = argv[2];
+            const sort_key = argv[3];
+
+            const res = try loader.setEntrySortKey(io, allocator, entry_id, sort_key);
+            defer res.deinit(allocator);
+
+            if (res.ok()) {
+                std.debug.print("[✔] 成功为条目 '{s}' 设置 sort-key 为 '{s}'！\n", .{ entry_id, sort_key });
                 return 0;
             } else {
                 std.debug.print("[-] 失败: {s}\n", .{res.stderr});
@@ -363,7 +415,9 @@ fn printHelp() void {
         \\  python run.py --set-loader-default <ID> 设置内层默认启动条目 (例如 arch-linux-zen.conf)
         \\  python run.py --set-loader-timeout <秒> 设置内层菜单倒计时 (例如 menu-force 或 3)
         \\  python run.py --set-options <ID> "<参数>" 设置指定内核条目的启动参数 (cmdline)
-        \\  python run.py --loader-edit <ID> [...] 编辑内层条目标题与参数
+        \\  python run.py --loader-edit <ID> [...] 编辑内层条目标题与参数 (支持 --title/--options/--sort-key)
+        \\  python run.py --loader-move <源顺位> <目标顺位> 切换调整内层启动条目排位顺序 (更新 sort-key)
+        \\  python run.py --loader-sort-key <ID> <KEY> 直接为内层条目设置自定义 sort-key 排序键
         \\  python run.py -h, --help          显示本帮助
         \\
         \\编辑参数 (配合 --edit 使用):
@@ -376,6 +430,7 @@ fn printHelp() void {
         \\内层参数 (配合 --loader-edit 使用):
         \\  --title <标题>     设置引导项显示标题
         \\  --options <参数>   设置内核启动参数 (cmdline)
+        \\  --sort-key <键名>  设置引导项排序权重键 (例如 01-windows, 02-zen)
         \\
         \\核心特性:
         \\  - Zig 0.17+ 原生机器码、Zero Runtime，单二进制独立交付；

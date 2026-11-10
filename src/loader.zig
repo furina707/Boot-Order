@@ -17,6 +17,7 @@ pub const LoaderEntry = struct {
     linux: []const u8,
     options: []const u8,
     efi: []const u8,
+    sort_key: []const u8,
     is_default: bool,
     is_conf_file: bool,
 
@@ -27,6 +28,7 @@ pub const LoaderEntry = struct {
             .linux = try allocator.dupe(u8, self.linux),
             .options = try allocator.dupe(u8, self.options),
             .efi = try allocator.dupe(u8, self.efi),
+            .sort_key = try allocator.dupe(u8, self.sort_key),
             .is_default = self.is_default,
             .is_conf_file = self.is_conf_file,
         };
@@ -38,6 +40,7 @@ pub const LoaderEntry = struct {
         allocator.free(self.linux);
         allocator.free(self.options);
         allocator.free(self.efi);
+        allocator.free(self.sort_key);
     }
 };
 
@@ -111,21 +114,23 @@ pub fn readPrivilegedFile(io: Io, allocator: std.mem.Allocator, filepath: []cons
     return allocator.dupe(u8, res.stdout);
 }
 
-/// 通过 sudo 将内容写入指定特权文件
+/// 通过 sudo 将内容原子写入指定特权文件 (先写临时文件再 sudo cp，彻底杜绝 stdin 管道密码混入)
 pub fn writePrivilegedFile(io: Io, allocator: std.mem.Allocator, filepath: []const u8, content: []const u8) !sys.RunResult {
-    var stdin_buf = try allocator.alloc(u8, DEFAULT_SUDO_PASS.len + content.len);
-    defer allocator.free(stdin_buf);
-    @memcpy(stdin_buf[0..DEFAULT_SUDO_PASS.len], DEFAULT_SUDO_PASS);
-    @memcpy(stdin_buf[DEFAULT_SUDO_PASS.len..], content);
+    const tmp_path = "/tmp/.boot_order_atomic_update.tmp";
+    const file = try std.Io.Dir.createFileAbsolute(io, tmp_path, .{ .truncate = true });
+    try file.writeStreamingAll(io, content);
+    file.close(io);
+    defer std.Io.Dir.deleteFileAbsolute(io, tmp_path) catch {};
 
     return sys.runWithStdin(io, allocator, &.{
         "sudo",
         "-S",
         "-p",
         "",
-        "tee",
+        "cp",
+        tmp_path,
         filepath,
-    }, stdin_buf);
+    }, DEFAULT_SUDO_PASS);
 }
 
 /// 解析 bootctl list 命令的结构化输出 (获取 systemd-boot 完整识别的全部启动项)
@@ -141,6 +146,7 @@ pub fn parseBootctlList(allocator: std.mem.Allocator, text: []const u8, default_
     var linux_path: []const u8 = "";
     var efi_path: []const u8 = "";
     var options_str: []const u8 = "";
+    var sort_key_str: []const u8 = "";
     var is_def = false;
     var has_windows_conf = false;
 
@@ -156,6 +162,7 @@ pub fn parseBootctlList(allocator: std.mem.Allocator, text: []const u8, default_
                     linux_path = "";
                     efi_path = "";
                     options_str = "";
+                    sort_key_str = "";
                     is_def = false;
                     continue;
                 }
@@ -175,6 +182,7 @@ pub fn parseBootctlList(allocator: std.mem.Allocator, text: []const u8, default_
                     .linux = try allocator.dupe(u8, linux_path),
                     .options = try allocator.dupe(u8, options_str),
                     .efi = try allocator.dupe(u8, efi_path),
+                    .sort_key = try allocator.dupe(u8, sort_key_str),
                     .is_default = is_def,
                     .is_conf_file = is_conf,
                 });
@@ -183,6 +191,7 @@ pub fn parseBootctlList(allocator: std.mem.Allocator, text: []const u8, default_
                 linux_path = "";
                 efi_path = "";
                 options_str = "";
+                sort_key_str = "";
                 is_def = false;
             }
             continue;
@@ -204,6 +213,8 @@ pub fn parseBootctlList(allocator: std.mem.Allocator, text: []const u8, default_
                 clean_title = std.mem.trim(u8, clean_title[0 .. clean_title.len - 10], " \t");
             }
             title = clean_title;
+        } else if (std.mem.eql(u8, key, "sort-key") or std.mem.eql(u8, key, "sortKey")) {
+            sort_key_str = val;
         } else if (std.mem.eql(u8, key, "linux")) {
             linux_path = val;
         } else if (std.mem.eql(u8, key, "efi")) {
@@ -226,6 +237,7 @@ pub fn parseBootctlList(allocator: std.mem.Allocator, text: []const u8, default_
                 .linux = try allocator.dupe(u8, linux_path),
                 .options = try allocator.dupe(u8, options_str),
                 .efi = try allocator.dupe(u8, efi_path),
+                .sort_key = try allocator.dupe(u8, sort_key_str),
                 .is_default = is_def,
                 .is_conf_file = is_conf,
             });
@@ -317,6 +329,7 @@ pub fn loadConfig(io: Io, allocator: std.mem.Allocator) !LoaderConfig {
                     var linux_path: []const u8 = "";
                     var options_str: []const u8 = "";
                     var efi_path: []const u8 = "";
+                    var sort_key_str: []const u8 = "";
 
                     var eit = std.mem.splitScalar(u8, entry_text, '\n');
                     while (eit.next()) |el| {
@@ -332,6 +345,8 @@ pub fn loadConfig(io: Io, allocator: std.mem.Allocator) !LoaderConfig {
                                 options_str = kv.val;
                             } else if (std.mem.eql(u8, kv.key, "efi")) {
                                 efi_path = kv.val;
+                            } else if (std.mem.eql(u8, kv.key, "sort-key") or std.mem.eql(u8, kv.key, "sortKey")) {
+                                sort_key_str = kv.val;
                             }
                         }
                     }
@@ -345,6 +360,7 @@ pub fn loadConfig(io: Io, allocator: std.mem.Allocator) !LoaderConfig {
                         .linux = try allocator.dupe(u8, linux_path),
                         .options = try allocator.dupe(u8, options_str),
                         .efi = try allocator.dupe(u8, efi_path),
+                        .sort_key = try allocator.dupe(u8, sort_key_str),
                         .is_default = is_def,
                         .is_conf_file = true,
                     });
@@ -374,6 +390,7 @@ pub fn loadConfig(io: Io, allocator: std.mem.Allocator) !LoaderConfig {
                 .linux = try allocator.dupe(u8, "/EFI/Linux/arch-linux.efi"),
                 .options = try allocator.dupe(u8, "内嵌于 UKI 二进制镜像 (.cmdline 节区)"),
                 .efi = try allocator.dupe(u8, ""),
+                .sort_key = try allocator.dupe(u8, "arch"),
                 .is_default = is_def,
                 .is_conf_file = false,
             });
@@ -456,6 +473,7 @@ pub fn saveEntryConfig(
     entry_id: []const u8,
     new_title: []const u8,
     new_options: []const u8,
+    new_sort_key: ?[]const u8,
 ) !sys.RunResult {
     var path_buf: [256]u8 = undefined;
     const full_path = try std.fmt.bufPrint(&path_buf, "/boot/loader/entries/{s}", .{entry_id});
@@ -468,6 +486,7 @@ pub fn saveEntryConfig(
 
     var has_title = false;
     var has_options = false;
+    var has_sort_key = false;
 
     if (old_content.len > 0) {
         var it = std.mem.splitScalar(u8, old_content, '\n');
@@ -488,6 +507,18 @@ pub fn saveEntryConfig(
                     try new_content.append(allocator, '\n');
                 }
                 has_options = true;
+            } else if (startsWithWord(trimmed, "sort-key")) {
+                if (new_sort_key) |sk| {
+                    if (sk.len > 0) {
+                        try new_content.appendSlice(allocator, "sort-key ");
+                        try new_content.appendSlice(allocator, sk);
+                        try new_content.append(allocator, '\n');
+                    }
+                } else {
+                    try new_content.appendSlice(allocator, line);
+                    try new_content.append(allocator, '\n');
+                }
+                has_sort_key = true;
             } else {
                 try new_content.appendSlice(allocator, line);
                 try new_content.append(allocator, '\n');
@@ -505,8 +536,155 @@ pub fn saveEntryConfig(
         try new_content.appendSlice(allocator, new_options);
         try new_content.append(allocator, '\n');
     }
+    if (!has_sort_key and new_sort_key != null and new_sort_key.?.len > 0) {
+        try new_content.appendSlice(allocator, "sort-key ");
+        try new_content.appendSlice(allocator, new_sort_key.?);
+        try new_content.append(allocator, '\n');
+    }
 
     return writePrivilegedFile(io, allocator, full_path, new_content.items);
+}
+
+pub fn cleanId(id: []const u8) []const u8 {
+    if (std.mem.endsWith(u8, id, ".conf")) {
+        return id[0 .. id.len - 5];
+    }
+    if (std.mem.endsWith(u8, id, ".efi")) {
+        return id[0 .. id.len - 4];
+    }
+    return id;
+}
+
+/// 写入或更新特定条目的 sort-key (例如 01-windows, 02-zen)
+pub fn setEntrySortKey(
+    io: Io,
+    allocator: std.mem.Allocator,
+    entry_id: []const u8,
+    sort_key: []const u8,
+) !sys.RunResult {
+    var path_buf: [256]u8 = undefined;
+    const full_path = try std.fmt.bufPrint(&path_buf, "/boot/loader/entries/{s}", .{entry_id});
+
+    const old_content = readPrivilegedFile(io, allocator, full_path) catch "";
+    defer if (old_content.len > 0) allocator.free(old_content);
+
+    var new_content = std.ArrayList(u8).empty;
+    defer new_content.deinit(allocator);
+
+    var has_sort_key = false;
+
+    if (old_content.len > 0) {
+        var it = std.mem.splitScalar(u8, old_content, '\n');
+        while (it.next()) |raw_line| {
+            const line = std.mem.trim(u8, raw_line, "\r");
+            const trimmed = std.mem.trim(u8, line, " \t");
+            if (trimmed.len == 0) continue;
+
+            if (startsWithWord(trimmed, "sort-key")) {
+                if (sort_key.len > 0) {
+                    try new_content.appendSlice(allocator, "sort-key ");
+                    try new_content.appendSlice(allocator, sort_key);
+                    try new_content.append(allocator, '\n');
+                }
+                has_sort_key = true;
+            } else {
+                try new_content.appendSlice(allocator, line);
+                try new_content.append(allocator, '\n');
+            }
+        }
+    }
+
+    if (!has_sort_key and sort_key.len > 0) {
+        try new_content.appendSlice(allocator, "sort-key ");
+        try new_content.appendSlice(allocator, sort_key);
+        try new_content.append(allocator, '\n');
+    }
+
+    return writePrivilegedFile(io, allocator, full_path, new_content.items);
+}
+
+/// 调整内层引导条目的排位顺位 (通过重分配 sort-key 决定 systemd-boot 菜单次序)
+pub fn moveLoaderEntry(
+    io: Io,
+    allocator: std.mem.Allocator,
+    cfg: LoaderConfig,
+    from_idx: usize,
+    to_idx: usize,
+) !sys.RunResult {
+    // 过滤出可调序条目 (排除固件自动生成的 auto- 条目)
+    var orderable = std.ArrayList(LoaderEntry).empty;
+    defer orderable.deinit(allocator);
+
+    for (cfg.entries.items) |e| {
+        if (!std.mem.startsWith(u8, e.id, "auto-")) {
+            try orderable.append(allocator, e);
+        }
+    }
+
+    if (from_idx >= orderable.items.len or to_idx >= orderable.items.len) {
+        return error.InvalidIndex;
+    }
+    if (from_idx == to_idx) {
+        return .{
+            .stdout = try allocator.dupe(u8, ""),
+            .stderr = try allocator.dupe(u8, ""),
+            .exit_code = 0,
+        };
+    }
+
+    // 在内存中调换元素顺位
+    const item = orderable.items[from_idx];
+    if (from_idx < to_idx) {
+        std.mem.copyForwards(LoaderEntry, orderable.items[from_idx..to_idx], orderable.items[from_idx + 1 .. to_idx + 1]);
+    } else {
+        std.mem.copyBackwards(LoaderEntry, orderable.items[to_idx + 1 .. from_idx + 1], orderable.items[to_idx..from_idx]);
+    }
+    orderable.items[to_idx] = item;
+
+    // 寻找不可直接修改配置文件的条目（如 UKI 镜像 arch-linux.efi，固化 sort-key 为 arch）
+    var fixed_idx: ?usize = null;
+    for (orderable.items, 0..) |e, i| {
+        if (!e.is_conf_file) {
+            fixed_idx = i;
+            break;
+        }
+    }
+
+    // 按照新的顺位依次给各个 .conf 条目分配并写入 sort-key
+    var last_res: ?sys.RunResult = null;
+    for (orderable.items, 0..) |e, i| {
+        if (!e.is_conf_file) continue;
+
+        var key_buf: [64]u8 = undefined;
+        var sort_key: []const u8 = undefined;
+
+        if (fixed_idx) |fidx| {
+            if (i < fidx) {
+                // 排在固定条目之前：使用 01, 02... 保证字典序在 "arch" 之前
+                sort_key = try std.fmt.bufPrint(&key_buf, "{d:0>2}-{s}", .{ i + 1, cleanId(e.id) });
+            } else {
+                // 排在固定条目之后：使用 b01, b02... 保证字典序在 "arch" 之后
+                sort_key = try std.fmt.bufPrint(&key_buf, "b{d:0>2}-{s}", .{ i - fidx, cleanId(e.id) });
+            }
+        } else {
+            // 没有固定条目：统一使用 01, 02...
+            sort_key = try std.fmt.bufPrint(&key_buf, "{d:0>2}-{s}", .{ i + 1, cleanId(e.id) });
+        }
+
+        if (last_res) |lr| lr.deinit(allocator);
+        last_res = try setEntrySortKey(io, allocator, e.id, sort_key);
+        if (!last_res.?.ok()) return last_res.?;
+    }
+
+    if (last_res) |lr| {
+        return lr;
+    }
+
+    return .{
+        .stdout = try allocator.dupe(u8, ""),
+        .stderr = try allocator.dupe(u8, ""),
+        .exit_code = 0,
+    };
 }
 
 pub const MockEntry = struct {
@@ -547,6 +725,7 @@ pub fn parseFromText(
         var linux_path: []const u8 = "";
         var options_str: []const u8 = "";
         var efi_path: []const u8 = "";
+        var sort_key_str: []const u8 = "";
 
         var eit = std.mem.splitScalar(u8, mock.content, '\n');
         while (eit.next()) |el| {
@@ -562,6 +741,8 @@ pub fn parseFromText(
                     options_str = kv.val;
                 } else if (std.mem.eql(u8, kv.key, "efi")) {
                     efi_path = kv.val;
+                } else if (std.mem.eql(u8, kv.key, "sort-key") or std.mem.eql(u8, kv.key, "sortKey")) {
+                    sort_key_str = kv.val;
                 }
             }
         }
@@ -575,6 +756,7 @@ pub fn parseFromText(
             .linux = try allocator.dupe(u8, linux_path),
             .options = try allocator.dupe(u8, options_str),
             .efi = try allocator.dupe(u8, efi_path),
+            .sort_key = try allocator.dupe(u8, sort_key_str),
             .is_default = is_def,
             .is_conf_file = true,
         });

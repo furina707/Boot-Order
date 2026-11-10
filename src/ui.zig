@@ -1104,6 +1104,7 @@ var loader_entries_dialog: ?*c.GtkWindow = null;
 var single_edit_dialog: ?*c.GtkWindow = null;
 var single_title_entry: ?*c.GtkEntry = null;
 var single_options_entry: ?*c.GtkEntry = null;
+var single_sort_key_entry: ?*c.GtkEntry = null;
 var single_entry_id_buf: [64]u8 = undefined;
 var single_entry_id_len: usize = 0;
 
@@ -1114,6 +1115,8 @@ const LoaderEntrySnapshot = struct {
     title_len: usize,
     options_buf: [256]u8,
     options_len: usize,
+    sort_key_buf: [64]u8,
+    sort_key_len: usize,
     is_conf_file: bool,
 };
 var cached_entries: [16]LoaderEntrySnapshot = undefined;
@@ -1173,8 +1176,19 @@ fn openLoaderEntriesDisplay() void {
         @memcpy(snap.options_buf[0..o_l], e.options[0..o_l]);
         snap.options_len = o_l;
 
+        const sk_l = @min(e.sort_key.len, snap.sort_key_buf.len);
+        @memcpy(snap.sort_key_buf[0..sk_l], e.sort_key[0..sk_l]);
+        snap.sort_key_len = sk_l;
+
         snap.is_conf_file = e.is_conf_file;
         cached_entries_count += 1;
+    }
+
+    var reorderable_count: usize = 0;
+    for (lcfg.entries.items) |e| {
+        if (!std.mem.startsWith(u8, e.id, "auto-")) {
+            reorderable_count += 1;
+        }
     }
 
     const dialog = c.gtk_window_new();
@@ -1203,7 +1217,7 @@ fn openLoaderEntriesDisplay() void {
     c.gtk_widget_add_css_class(@ptrCast(head_lbl), gtk.s("entry-title"));
     c.gtk_box_append(@ptrCast(top_card), @ptrCast(head_lbl));
 
-    const desc_lbl = c.gtk_label_new(gtk.s("以下为当前主板固件 Boot0002 启动时呈现的系统引导条目，可直接置顶首选项或编辑内核参数："));
+    const desc_lbl = c.gtk_label_new(gtk.s("以下为当前主板固件 Boot0002 启动时呈现的系统引导条目，支持自由切换顺位(▲/▼)、置顶首选项或编辑内核参数："));
     c.gtk_label_set_xalign(@ptrCast(desc_lbl), 0.0);
     c.gtk_widget_add_css_class(@ptrCast(desc_lbl), gtk.s("entry-sub"));
     c.gtk_box_append(@ptrCast(top_card), @ptrCast(desc_lbl));
@@ -1313,6 +1327,18 @@ fn openLoaderEntriesDisplay() void {
             c.gtk_box_append(@ptrCast(btn_box), btn_top);
         }
 
+        if (idx < reorderable_count and idx > 0) {
+            const btn_up = c.gtk_button_new_with_label(gtk.s("▲"));
+            _ = c.g_signal_connect_data(@ptrCast(btn_up), gtk.s("clicked"), @ptrCast(&onMoveLoaderEntryUpClicked), user_data, null, 0);
+            c.gtk_box_append(@ptrCast(btn_box), btn_up);
+        }
+
+        if (idx < reorderable_count and idx < reorderable_count - 1) {
+            const btn_down = c.gtk_button_new_with_label(gtk.s("▼"));
+            _ = c.g_signal_connect_data(@ptrCast(btn_down), gtk.s("clicked"), @ptrCast(&onMoveLoaderEntryDownClicked), user_data, null, 0);
+            c.gtk_box_append(@ptrCast(btn_box), btn_down);
+        }
+
         if (e.is_conf_file) {
             const btn_edit = c.gtk_button_new_with_label(gtk.s("✏ 编辑条目"));
             _ = c.g_signal_connect_data(@ptrCast(btn_edit), gtk.s("clicked"), @ptrCast(&onEditSingleEntryClicked), user_data, null, 0);
@@ -1369,6 +1395,50 @@ fn onSetLoaderDefaultClicked(_: *c.GtkButton, user_data: ?*anyopaque) callconv(.
     }
 }
 
+fn onMoveLoaderEntryUpClicked(_: *c.GtkButton, user_data: ?*anyopaque) callconv(.c) void {
+    const idx = @intFromPtr(user_data);
+    if (idx == 0 or idx >= cached_entries_count) return;
+
+    var lcfg = sdboot.loadConfig(state.io, state.gpa) catch return;
+    defer lcfg.deinit(state.gpa);
+
+    const res = sdboot.moveLoaderEntry(state.io, state.gpa, lcfg, idx, idx - 1) catch |err| {
+        showStatus(gtk.zfmt("[-] 调整启动项顺位失败: {s}", .{@errorName(err)}), true);
+        return;
+    };
+    defer res.deinit(state.gpa);
+
+    if (res.ok()) {
+        refreshData();
+        openLoaderEntriesDisplay();
+        showStatus(gtk.zfmt("✔ 启动项顺位已上移至 #{d} (已更新 systemd-boot 菜单次序)", .{idx}), false);
+    } else {
+        showStatus(res.stderr, true);
+    }
+}
+
+fn onMoveLoaderEntryDownClicked(_: *c.GtkButton, user_data: ?*anyopaque) callconv(.c) void {
+    const idx = @intFromPtr(user_data);
+    if (idx + 1 >= cached_entries_count) return;
+
+    var lcfg = sdboot.loadConfig(state.io, state.gpa) catch return;
+    defer lcfg.deinit(state.gpa);
+
+    const res = sdboot.moveLoaderEntry(state.io, state.gpa, lcfg, idx, idx + 1) catch |err| {
+        showStatus(gtk.zfmt("[-] 调整启动项顺位失败: {s}", .{@errorName(err)}), true);
+        return;
+    };
+    defer res.deinit(state.gpa);
+
+    if (res.ok()) {
+        refreshData();
+        openLoaderEntriesDisplay();
+        showStatus(gtk.zfmt("✔ 启动项顺位已下移至 #{d} (已更新 systemd-boot 菜单次序)", .{idx + 2}), false);
+    } else {
+        showStatus(res.stderr, true);
+    }
+}
+
 fn onEditSingleEntryClicked(_: *c.GtkButton, user_data: ?*anyopaque) callconv(.c) void {
     const idx = @intFromPtr(user_data);
     if (idx >= cached_entries_count) return;
@@ -1386,7 +1456,7 @@ fn onEditSingleEntryClicked(_: *c.GtkButton, user_data: ?*anyopaque) callconv(.c
     c.gtk_window_set_title(@ptrCast(dialog), gtk.s(gtk.zfmt("编辑启动项: {s}", .{title})));
     c.gtk_window_set_transient_for(@ptrCast(dialog), @ptrCast(loader_entries_dialog));
     c.gtk_window_set_modal(@ptrCast(dialog), 1);
-    c.gtk_window_set_default_size(@ptrCast(dialog), 580, 260);
+    c.gtk_window_set_default_size(@ptrCast(dialog), 600, 320);
 
     const box = c.gtk_box_new(@intCast(c.GTK_ORIENTATION_VERTICAL), 10);
     c.gtk_widget_set_margin_start(@ptrCast(box), 20);
@@ -1404,6 +1474,15 @@ fn onEditSingleEntryClicked(_: *c.GtkButton, user_data: ?*anyopaque) callconv(.c
         c.gtk_box_append(@ptrCast(box), f_opt.container);
     } else {
         single_options_entry = null;
+    }
+
+    if (snap.is_conf_file) {
+        const sk = snap.sort_key_buf[0..snap.sort_key_len];
+        const f_sk = createFormField("引导排位排序键 (sort-key, 决定启动菜单排位):", gtk.zstr(sk));
+        single_sort_key_entry = f_sk.entry;
+        c.gtk_box_append(@ptrCast(box), f_sk.container);
+    } else {
+        single_sort_key_entry = null;
     }
 
     const btn_row = c.gtk_box_new(@intCast(c.GTK_ORIENTATION_HORIZONTAL), 10);
@@ -1435,8 +1514,16 @@ fn onSaveSingleEntry(_: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
     const entry_id = single_entry_id_buf[0..single_entry_id_len];
     const new_title = std.mem.span(c.gtk_editable_get_text(@ptrCast(single_title_entry.?)));
     const new_options = if (single_options_entry) |oe| std.mem.span(c.gtk_editable_get_text(@ptrCast(oe))) else "";
+    const new_sort_key = if (single_sort_key_entry) |ske| std.mem.span(c.gtk_editable_get_text(@ptrCast(ske))) else "";
 
-    const res = sdboot.saveEntryConfig(state.io, state.gpa, entry_id, new_title, new_options) catch |err| {
+    const res = sdboot.saveEntryConfig(
+        state.io,
+        state.gpa,
+        entry_id,
+        new_title,
+        new_options,
+        if (new_sort_key.len > 0) new_sort_key else null,
+    ) catch |err| {
         showStatus(gtk.zfmt("[-] 保存启动项失败: {s}", .{@errorName(err)}), true);
         return;
     };
