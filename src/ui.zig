@@ -924,7 +924,7 @@ fn onSetTimeoutClicked(_: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
     timeout_spin = @ptrCast(spin);
     c.gtk_box_append(@ptrCast(box), @ptrCast(spin));
 
-    const tip_lbl = c.gtk_label_new(gtk.s("💡 提示：此项控制主板固件开机时等待快捷键的秒数。如需取消引导菜单的自动进入，请在「编辑启动项」中选择「🛑 取消自动进入 (必须手动选择系统)」。"));
+    const tip_lbl = c.gtk_label_new(gtk.s("💡 提示：此项为主板固件 (NVRAM) 开机等待时间（秒）。设为 0 表示主板自检后直接加载引导程序。"));
     c.gtk_label_set_xalign(@ptrCast(tip_lbl), 0.0);
     c.gtk_label_set_wrap(@ptrCast(tip_lbl), 1);
     c.gtk_widget_add_css_class(@ptrCast(tip_lbl), gtk.s("entry-sub"));
@@ -1161,51 +1161,6 @@ fn onEditClicked(_: *c.GtkButton, user_data: ?*anyopaque) callconv(.c) void {
     }
 }
 
-fn onDisableAutoBootClicked(_: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
-    const res = sdboot.setLoaderTimeout(state.io, state.gpa, "menu-force") catch |err| {
-        showStatus(gtk.zfmt("[-] 设置失败: {s}", .{@errorName(err)}), true);
-        return;
-    };
-    defer res.deinit(state.gpa);
-    if (res.ok()) {
-        refreshData();
-        openLoaderEntriesDisplay();
-        showStatus(gtk.zstr("✔ 已成功取消自动进入！开机常驻引导菜单，必须手动选择系统进入。"), false);
-    } else {
-        showStatus(res.stderr, true);
-    }
-}
-
-fn onSetLoaderTimeout3Clicked(_: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
-    const res = sdboot.setLoaderTimeout(state.io, state.gpa, "3") catch |err| {
-        showStatus(gtk.zfmt("[-] 设置倒计时失败: {s}", .{@errorName(err)}), true);
-        return;
-    };
-    defer res.deinit(state.gpa);
-    if (res.ok()) {
-        refreshData();
-        openLoaderEntriesDisplay();
-        showStatus(gtk.zstr("✔ 已设置为「倒计时 3 秒后自动进入默认系统」。"), false);
-    } else {
-        showStatus(res.stderr, true);
-    }
-}
-
-fn onSetLoaderTimeout5Clicked(_: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
-    const res = sdboot.setLoaderTimeout(state.io, state.gpa, "5") catch |err| {
-        showStatus(gtk.zfmt("[-] 设置倒计时失败: {s}", .{@errorName(err)}), true);
-        return;
-    };
-    defer res.deinit(state.gpa);
-    if (res.ok()) {
-        refreshData();
-        openLoaderEntriesDisplay();
-        showStatus(gtk.zstr("✔ 已设置为「倒计时 5 秒后自动进入默认系统」。"), false);
-    } else {
-        showStatus(res.stderr, true);
-    }
-}
-
 fn openLoaderEntriesDisplay() void {
     if (loader_entries_dialog) |d| {
         c.gtk_window_destroy(d);
@@ -1283,63 +1238,6 @@ fn openLoaderEntriesDisplay() void {
     c.gtk_box_append(@ptrCast(top_card), @ptrCast(desc_lbl));
 
     c.gtk_box_append(@ptrCast(content_box), @ptrCast(top_card));
-
-    // ── 开机引导模式与自动进入控制 ──
-    const menu_card = c.gtk_box_new(@intCast(c.GTK_ORIENTATION_VERTICAL), 8);
-    c.gtk_widget_add_css_class(@ptrCast(menu_card), gtk.s("card-loader"));
-
-    // 标题行与状态药丸
-    const mc_head = c.gtk_box_new(@intCast(c.GTK_ORIENTATION_HORIZONTAL), 8);
-    const mc_title = c.gtk_label_new(gtk.s("🛑 开机自动进入控制"));
-    c.gtk_widget_add_css_class(@ptrCast(mc_title), gtk.s("entry-title"));
-    c.gtk_box_append(@ptrCast(mc_head), @ptrCast(mc_title));
-
-    const is_force = std.mem.eql(u8, lcfg.timeout, "menu-force");
-
-    const st_badge = if (is_force)
-        c.gtk_label_new(gtk.s("🛑 已取消自动进入 (必须手动选择系统)"))
-    else
-        c.gtk_label_new(gtk.s(gtk.zfmt("⏱ 倒计时 {s} 秒后自动进入", .{lcfg.timeout})));
-
-    c.gtk_widget_add_css_class(@ptrCast(st_badge), gtk.s("pill-badge"));
-    if (is_force) {
-        c.gtk_widget_add_css_class(@ptrCast(st_badge), gtk.s("badge-green"));
-    } else {
-        c.gtk_widget_add_css_class(@ptrCast(st_badge), gtk.s("badge-amber"));
-    }
-    c.gtk_box_append(@ptrCast(mc_head), @ptrCast(st_badge));
-    c.gtk_box_append(@ptrCast(menu_card), @ptrCast(mc_head));
-
-    // 说明文案
-    const mc_desc_text = if (is_force)
-        "当前状态：已取消自动进入！开机时引导菜单常驻停留，不倒计时，必须由您手动按键盘选中系统后按 Enter 键进入。"
-    else
-        gtk.zfmt("当前状态：显示菜单并在倒计时 {s} 秒后自动进入默认系统。如需取消自动进入，请点击下方「🛑 取消自动进入」按钮。", .{lcfg.timeout});
-
-    const mc_desc = c.gtk_label_new(gtk.s(mc_desc_text));
-    c.gtk_label_set_xalign(@ptrCast(mc_desc), 0.0);
-    c.gtk_label_set_wrap(@ptrCast(mc_desc), 1);
-    c.gtk_widget_add_css_class(@ptrCast(mc_desc), gtk.s("entry-sub"));
-    c.gtk_box_append(@ptrCast(menu_card), @ptrCast(mc_desc));
-
-    // 操作按钮行
-    const mc_btn_row = c.gtk_box_new(@intCast(c.GTK_ORIENTATION_HORIZONTAL), 8);
-
-    const btn_manual = c.gtk_button_new_with_label(gtk.s("🛑 取消自动进入 (必须手动选择系统)"));
-    if (is_force) c.gtk_widget_add_css_class(@ptrCast(btn_manual), gtk.s("suggested-action"));
-    _ = c.g_signal_connect_data(@ptrCast(btn_manual), gtk.s("clicked"), @ptrCast(&onDisableAutoBootClicked), null, null, 0);
-    c.gtk_box_append(@ptrCast(mc_btn_row), btn_manual);
-
-    const btn_to_3 = c.gtk_button_new_with_label(gtk.s("⏱ 倒计时 3 秒后自动进入"));
-    _ = c.g_signal_connect_data(@ptrCast(btn_to_3), gtk.s("clicked"), @ptrCast(&onSetLoaderTimeout3Clicked), null, null, 0);
-    c.gtk_box_append(@ptrCast(mc_btn_row), btn_to_3);
-
-    const btn_to_5 = c.gtk_button_new_with_label(gtk.s("⏱ 倒计时 5 秒后自动进入"));
-    _ = c.g_signal_connect_data(@ptrCast(btn_to_5), gtk.s("clicked"), @ptrCast(&onSetLoaderTimeout5Clicked), null, null, 0);
-    c.gtk_box_append(@ptrCast(mc_btn_row), btn_to_5);
-
-    c.gtk_box_append(@ptrCast(menu_card), @ptrCast(mc_btn_row));
-    c.gtk_box_append(@ptrCast(content_box), @ptrCast(menu_card));
 
     // ── 启动项卡片列表 ──
     for (lcfg.entries.items, 0..) |e, idx| {
