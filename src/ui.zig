@@ -917,6 +917,12 @@ fn onSetTimeoutClicked(_: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
     timeout_spin = @ptrCast(spin);
     c.gtk_box_append(@ptrCast(box), @ptrCast(spin));
 
+    const tip_lbl = c.gtk_label_new(gtk.s("💡 说明：设为 0 表示没有等待（直接进入第一启动项）；设为 >0 秒则开机时主板会倒计时等待按键。"));
+    c.gtk_label_set_xalign(@ptrCast(tip_lbl), 0.0);
+    c.gtk_label_set_wrap(@ptrCast(tip_lbl), 1);
+    c.gtk_widget_add_css_class(@ptrCast(tip_lbl), gtk.s("entry-sub"));
+    c.gtk_box_append(@ptrCast(box), @ptrCast(tip_lbl));
+
     const btn_row = c.gtk_box_new(@intCast(c.GTK_ORIENTATION_HORIZONTAL), 10);
     c.gtk_widget_set_halign(@ptrCast(btn_row), @intCast(c.GTK_ALIGN_END));
 
