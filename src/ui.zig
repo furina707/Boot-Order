@@ -900,13 +900,28 @@ fn onFixWarningClicked(_: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
 var timeout_spin: ?*c.GtkSpinButton = null;
 var timeout_dialog: ?*c.GtkWindow = null;
 
+fn onDisableAutoBootFromDialog(_: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
+    const res_ld = sdboot.setLoaderTimeout(state.io, state.gpa, "menu-force") catch |err| {
+        showStatus(gtk.zfmt("[-] 取消自动进入失败: {s}", .{@errorName(err)}), true);
+        return;
+    };
+    defer res_ld.deinit(state.gpa);
+
+    const res_nv = nvram.setTimeout(state.io, state.gpa, 0) catch null;
+    if (res_nv) |r| r.deinit(state.gpa);
+
+    refreshData();
+    onCloseTimeoutDialog(@ptrCast(c.gtk_button_new()), null);
+    showStatus(gtk.zstr("✔ 已成功取消自动进入！开机常驻引导菜单，必须手动选择系统进入。"), false);
+}
+
 fn onSetTimeoutClicked(_: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
     const dialog = c.gtk_window_new();
     timeout_dialog = @ptrCast(dialog);
     c.gtk_window_set_title(@ptrCast(dialog), gtk.s("设置固件引导超时时间"));
     c.gtk_window_set_transient_for(@ptrCast(dialog), state.window);
     c.gtk_window_set_modal(@ptrCast(dialog), 1);
-    c.gtk_window_set_default_size(@ptrCast(dialog), 380, 160);
+    c.gtk_window_set_default_size(@ptrCast(dialog), 400, 220);
 
     const box = c.gtk_box_new(@intCast(c.GTK_ORIENTATION_VERTICAL), 12);
     c.gtk_widget_set_margin_start(@ptrCast(box), 20);
@@ -924,7 +939,29 @@ fn onSetTimeoutClicked(_: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
     timeout_spin = @ptrCast(spin);
     c.gtk_box_append(@ptrCast(box), @ptrCast(spin));
 
-    const tip_lbl = c.gtk_label_new(gtk.s("💡 提示：此项为主板固件 (NVRAM) 开机等待时间（秒）。设为 0 表示主板自检后直接加载引导程序。"));
+    // 取消自动进入功能按钮
+    var is_menu_force = false;
+    var lcfg_opt = sdboot.loadConfig(state.io, state.gpa) catch null;
+    if (lcfg_opt) |*lc| {
+        defer lc.deinit(state.gpa);
+        if (std.mem.eql(u8, lc.timeout, "menu-force")) {
+            is_menu_force = true;
+        }
+    }
+
+    const btn_label = if (is_menu_force)
+        gtk.s("🛑 已取消自动进入 (当前状态：必须手动选择系统)")
+    else
+        gtk.s("🛑 取消自动进入 (开机常驻菜单，必须手动选择系统)");
+
+    const btn_disable_auto = c.gtk_button_new_with_label(btn_label);
+    if (is_menu_force) {
+        c.gtk_widget_add_css_class(@ptrCast(btn_disable_auto), gtk.s("suggested-action"));
+    }
+    _ = c.g_signal_connect_data(@ptrCast(btn_disable_auto), gtk.s("clicked"), @ptrCast(&onDisableAutoBootFromDialog), null, null, 0);
+    c.gtk_box_append(@ptrCast(box), @ptrCast(btn_disable_auto));
+
+    const tip_lbl = c.gtk_label_new(gtk.s("💡 提示：点击上方「取消自动进入」后，开机引导菜单将常驻停留，不倒计时，必须手动选择系统进入。"));
     c.gtk_label_set_xalign(@ptrCast(tip_lbl), 0.0);
     c.gtk_label_set_wrap(@ptrCast(tip_lbl), 1);
     c.gtk_widget_add_css_class(@ptrCast(tip_lbl), gtk.s("entry-sub"));
