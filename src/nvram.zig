@@ -386,6 +386,17 @@ pub fn moveOrder(io: Io, allocator: std.mem.Allocator, cfg: BootConfig, from_idx
     return setBootOrder(io, allocator, new_order);
 }
 
+/// 从设备详情路径中解析 ESP 分区号 (例如从 "HD(5,GPT,...)" 中提取 5)
+pub fn parsePartition(device_path: []const u8) u32 {
+    if (std.mem.indexOf(u8, device_path, "HD(")) |idx| {
+        const rest = device_path[idx + 3 ..];
+        if (std.mem.indexOfScalar(u8, rest, ',')) |comma| {
+            return std.fmt.parseInt(u32, rest[0..comma], 10) catch 1;
+        }
+    }
+    return 1;
+}
+
 /// 创建/注册新启动项 (efibootmgr -c -d <disk> -p <part> -L <label> -l <loader>)
 pub fn createEntry(
     io: Io,
@@ -409,4 +420,89 @@ pub fn createEntry(
         "-l",
         loader,
     }, true);
+}
+
+/// 编辑/更新现有指定编号的启动项 (例如 Boot0002)
+/// 保持原有 BootOrder 顺位位置不变
+pub fn editEntry(
+    io: Io,
+    allocator: std.mem.Allocator,
+    cfg: BootConfig,
+    ident: [4]u8,
+    disk: []const u8,
+    part: u32,
+    label: []const u8,
+    loader: []const u8,
+    active: bool,
+) !sys.RunResult {
+    // 1. 记录原启动项在 BootOrder 中的位置
+    var order_copy = std.ArrayList([4]u8).empty;
+    defer order_copy.deinit(allocator);
+    for (cfg.boot_order.items) |id| {
+        try order_copy.append(allocator, id);
+    }
+    const was_in_order = cfg.inBootOrder(ident);
+
+    // 2. 删除原启动项以允许用同名编号覆盖重建
+    const del_res = deleteEntry(io, allocator, ident) catch null;
+    if (del_res) |dr| dr.deinit(allocator);
+
+    // 3. 重新创建指定编号条目 (-b <ident> -c ...)
+    var part_buf: [16]u8 = undefined;
+    const part_str = try std.fmt.bufPrint(&part_buf, "{d}", .{part});
+
+    const create_res = try runEfibootmgr(io, allocator, &.{
+        "-b",
+        &ident,
+        "-c",
+        "-d",
+        disk,
+        "-p",
+        part_str,
+        "-L",
+        label,
+        "-l",
+        loader,
+    }, true);
+
+    if (!create_res.ok()) {
+        return create_res;
+    }
+    create_res.deinit(allocator);
+
+    // 4. 若用户指定为禁用，调用 setActive
+    if (!active) {
+        const act_res = try setActive(io, allocator, ident, false);
+        act_res.deinit(allocator);
+    }
+
+    // 5. 还原 BootOrder 中的位置，杜绝 efibootmgr -c 擅自强行置顶打乱原有顺位
+    if (was_in_order) {
+        var restored = std.ArrayList([4]u8).empty;
+        defer restored.deinit(allocator);
+        var placed = false;
+        for (order_copy.items) |id| {
+            // 过滤幽灵无效条目（例如 2002, 2004），避免 efibootmgr 报错
+            if (cfg.findEntry(id) == null and !std.mem.eql(u8, &id, &ident)) continue;
+
+            if (std.mem.eql(u8, &id, &ident)) {
+                try restored.append(allocator, ident);
+                placed = true;
+            } else {
+                try restored.append(allocator, id);
+            }
+        }
+        if (!placed) try restored.append(allocator, ident);
+        return setBootOrder(io, allocator, restored.items);
+    } else {
+        var filtered = std.ArrayList([4]u8).empty;
+        defer filtered.deinit(allocator);
+        for (order_copy.items) |id| {
+            if (cfg.findEntry(id) == null) continue;
+            if (!std.mem.eql(u8, &id, &ident)) {
+                try filtered.append(allocator, id);
+            }
+        }
+        return setBootOrder(io, allocator, filtered.items);
+    }
 }

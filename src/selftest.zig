@@ -32,7 +32,7 @@ pub fn run(init: std.process.Init) !u8 {
     std.debug.print("==================================================\n", .{});
 
     // 1. 测试解析
-    std.debug.print("[1/4] 测试 efibootmgr -v 输出解析器...", .{});
+    std.debug.print("[1/5] 测试 efibootmgr -v 输出解析器...", .{});
     var cfg = try nvram.parseOutput(allocator, SAMPLE_EFIBOOTMGR_OUTPUT);
     defer cfg.deinit(allocator);
 
@@ -83,7 +83,7 @@ pub fn run(init: std.process.Init) !u8 {
     std.debug.print(" [OK]\n", .{});
 
     // 2. 测试去重与幽灵过滤
-    std.debug.print("[2/4] 测试 BootOrder 自动去重与幽灵条目过滤算法...", .{});
+    std.debug.print("[2/5] 测试 BootOrder 自动去重与幽灵条目过滤算法...", .{});
     var dedup_order = try cfg.getDeduplicatedOrder(allocator);
     defer dedup_order.deinit(allocator);
 
@@ -101,7 +101,7 @@ pub fn run(init: std.process.Init) !u8 {
     std.debug.print(" [OK]\n", .{});
 
     // 3. 测试首选项置顶算法
-    std.debug.print("[3/4] 测试首选启动项置顶调整...", .{});
+    std.debug.print("[3/5] 测试首选启动项置顶调整...", .{});
     var new_order = std.ArrayList([4]u8).empty;
     defer new_order.deinit(allocator);
     // 把 0005 置顶
@@ -119,8 +119,22 @@ pub fn run(init: std.process.Init) !u8 {
     }
     std.debug.print(" [OK]\n", .{});
 
-    // 4. 测试系统权限与 efibootmgr 可用性探针
-    std.debug.print("[4/4] 测试真实系统 efibootmgr 命令探针...", .{});
+    // 4. 测试设备路径 ESP 分区号解析算法
+    std.debug.print("[4/5] 测试设备路径 ESP 分区号解析算法...", .{});
+    const p5 = nvram.parsePartition("HD(5,GPT,3833dd23-333d-4cde-b586-07884557ed87,0x30042000,0x1e8800)");
+    if (p5 != 5) {
+        std.debug.print("\n[FAIL] 分区号解析错误: 期望 5，实际 {d}\n", .{p5});
+        return 1;
+    }
+    const p1 = nvram.parsePartition("HD(1,GPT,83866a79-ae26-47fd-8aac-7779ac80fb3e,0x800,0x64000)");
+    if (p1 != 1) {
+        std.debug.print("\n[FAIL] 分区号解析错误: 期望 1，实际 {d}\n", .{p1});
+        return 1;
+    }
+    std.debug.print(" [OK]\n", .{});
+
+    // 5. 测试系统权限与 efibootmgr 可用性探针
+    std.debug.print("[5/5] 测试真实系统 efibootmgr 命令探针...", .{});
     // 检查 efibootmgr 二进制是否存在
     const probe_res = sys.run(io, allocator, &.{ "efibootmgr", "-v" }) catch |err| {
         std.debug.print("\n[WARN] 无法启动 efibootmgr 进程: {s} (非 UEFI 环境可能跳过)\n", .{@errorName(err)});

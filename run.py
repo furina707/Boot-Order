@@ -18,8 +18,9 @@
     python run.py                   构建并启动 GTK4 原生图形界面 (默认)
     python run.py selftest          运行内建全链路功能自检 (数据/算法/语法断言)
     python run.py --list            查看当前 NVRAM 全部启动项与顺序 (CLI)
-    python run.py --set-default ID  快速设置第一启动项 (例如: 0005)
+    python run.py --set-default ID  快速设置第一启动项 (例如: 0002)
     python run.py --set-next ID     设置下次开机单次启动 (BootNext)
+    python run.py --edit ID [...]   编辑启动项 (例如: python run.py --edit 0002 --label "Linux")
     python run.py --set-timeout SEC 设置固件引导倒计时超时时间
     python run.py --dedup           自动清理 BootOrder 重复项
     python run.py --build-only      仅编译 Zig 二进制，不启动

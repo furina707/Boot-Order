@@ -562,7 +562,12 @@ fn createEntryCard(
     _ = c.g_signal_connect_data(@ptrCast(btn_toggle), gtk.s("clicked"), @ptrCast(&onToggleActiveClicked), user_data, null, 0);
     c.gtk_box_append(@ptrCast(btn_box), btn_toggle);
 
-    // 6. 删除（安全模态确认防误触）
+    // 6. 编辑条目 (修改显示名称、分区号、加载器路径与状态)
+    const btn_edit = c.gtk_button_new_with_label(gtk.s("✏ 编辑"));
+    _ = c.g_signal_connect_data(@ptrCast(btn_edit), gtk.s("clicked"), @ptrCast(&onEditClicked), user_data, null, 0);
+    c.gtk_box_append(@ptrCast(btn_box), btn_edit);
+
+    // 7. 删除（安全模态确认防误触）
     const btn_del = c.gtk_button_new_with_label(gtk.s("🗑"));
     c.gtk_widget_add_css_class(@ptrCast(btn_del), gtk.s("destructive-action"));
     _ = c.g_signal_connect_data(@ptrCast(btn_del), gtk.s("clicked"), @ptrCast(&onDeleteClicked), user_data, null, 0);
@@ -1019,4 +1024,167 @@ fn onSaveNewEntry(_: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
     }
 
     onCloseAddDialog(@ptrCast(c.gtk_button_new()), null);
+}
+
+// ============================================================================
+// 对话框：编辑现有启动项 (支持 Boot0002 等任意条目)
+// ============================================================================
+
+var edit_dialog: ?*c.GtkWindow = null;
+var edit_ident: [4]u8 = undefined;
+var edit_disk_entry: ?*c.GtkEntry = null;
+var edit_part_entry: ?*c.GtkEntry = null;
+var edit_label_entry: ?*c.GtkEntry = null;
+var edit_loader_entry: ?*c.GtkEntry = null;
+var edit_active_switch: ?*c.GtkSwitch = null;
+
+fn onEditClicked(_: *c.GtkButton, user_data: ?*anyopaque) callconv(.c) void {
+    const ident = unpackIdent(user_data);
+    edit_ident = ident;
+
+    const dialog = c.gtk_window_new();
+    edit_dialog = @ptrCast(dialog);
+
+    const title_text = gtk.zfmt("编辑 UEFI 启动项 [Boot{s}]", .{ident});
+    c.gtk_window_set_title(@ptrCast(dialog), gtk.s(title_text));
+    c.gtk_window_set_transient_for(@ptrCast(dialog), state.window);
+    c.gtk_window_set_modal(@ptrCast(dialog), 1);
+    c.gtk_window_set_default_size(@ptrCast(dialog), 540, 420);
+
+    const box = c.gtk_box_new(@intCast(c.GTK_ORIENTATION_VERTICAL), 10);
+    c.gtk_widget_set_margin_start(@ptrCast(box), 20);
+    c.gtk_widget_set_margin_end(@ptrCast(box), 20);
+    c.gtk_widget_set_margin_top(@ptrCast(box), 16);
+    c.gtk_widget_set_margin_bottom(@ptrCast(box), 16);
+
+    // 获取当前条目已有信息
+    var cur_title: []const u8 = "";
+    var cur_path: []const u8 = "";
+    var cur_part: u32 = 5;
+    var cur_active = true;
+
+    if (state.cfg) |cfg| {
+        if (cfg.findEntry(ident)) |e| {
+            cur_title = e.title;
+            cur_path = e.path;
+            cur_part = nvram.parsePartition(e.device_path);
+            cur_active = e.active;
+        }
+    }
+
+    // 预设快速替换行
+    const preset_box = c.gtk_box_new(@intCast(c.GTK_ORIENTATION_HORIZONTAL), 6);
+    const p1 = c.gtk_button_new_with_label(gtk.s("预设: systemd-boot"));
+    _ = c.g_signal_connect_data(@ptrCast(p1), gtk.s("clicked"), @ptrCast(&onEditPresetSdBoot), null, null, 0);
+    c.gtk_box_append(@ptrCast(preset_box), p1);
+
+    const p2 = c.gtk_button_new_with_label(gtk.s("预设: Windows"));
+    _ = c.g_signal_connect_data(@ptrCast(p2), gtk.s("clicked"), @ptrCast(&onEditPresetWin), null, null, 0);
+    c.gtk_box_append(@ptrCast(preset_box), p2);
+
+    const p3 = c.gtk_button_new_with_label(gtk.s("预设: GRUB"));
+    _ = c.g_signal_connect_data(@ptrCast(p3), gtk.s("clicked"), @ptrCast(&onEditPresetGrub), null, null, 0);
+    c.gtk_box_append(@ptrCast(preset_box), p3);
+
+    c.gtk_box_append(@ptrCast(box), preset_box);
+
+    // 输入字段 (带当前值预填充)
+    const f1 = createFormField("磁盘设备路径 (例如 /dev/nvme0n1 或 /dev/sda):", "/dev/nvme0n1");
+    edit_disk_entry = f1.entry;
+    c.gtk_box_append(@ptrCast(box), f1.container);
+
+    const part_str = gtk.zfmt("{d}", .{cur_part});
+    const f2 = createFormField("ESP 分区号 (例如 5 或 1):", part_str);
+    edit_part_entry = f2.entry;
+    c.gtk_box_append(@ptrCast(box), f2.container);
+
+    const title_z = gtk.zstr(cur_title);
+    const f3 = createFormField("固件显示标签 (Label):", title_z);
+    edit_label_entry = f3.entry;
+    c.gtk_box_append(@ptrCast(box), f3.container);
+
+    const path_z = if (cur_path.len > 0) gtk.zstr(cur_path) else gtk.zstr("\\EFI\\systemd\\systemd-bootx64.efi");
+    const f4 = createFormField("EFI 加载器路径 (Loader):", path_z);
+    edit_loader_entry = f4.entry;
+    c.gtk_box_append(@ptrCast(box), f4.container);
+
+    // 激活状态开关
+    const act_row = c.gtk_box_new(@intCast(c.GTK_ORIENTATION_HORIZONTAL), 10);
+    const act_lbl = c.gtk_label_new(gtk.s("是否保持启用该启动项:"));
+    c.gtk_box_append(@ptrCast(act_row), @ptrCast(act_lbl));
+
+    const sw = c.gtk_switch_new();
+    c.gtk_switch_set_active(@ptrCast(sw), if (cur_active) 1 else 0);
+    edit_active_switch = @ptrCast(sw);
+    c.gtk_box_append(@ptrCast(act_row), @ptrCast(sw));
+    c.gtk_box_append(@ptrCast(box), act_row);
+
+    // 底部按钮栏
+    const btn_row = c.gtk_box_new(@intCast(c.GTK_ORIENTATION_HORIZONTAL), 10);
+    c.gtk_widget_set_halign(@ptrCast(btn_row), @intCast(c.GTK_ALIGN_END));
+
+    const btn_cancel = c.gtk_button_new_with_label(gtk.s("取消"));
+    _ = c.g_signal_connect_data(@ptrCast(btn_cancel), gtk.s("clicked"), @ptrCast(&onCloseEditDialog), null, null, 0);
+    c.gtk_box_append(@ptrCast(btn_row), btn_cancel);
+
+    const btn_save = c.gtk_button_new_with_label(gtk.s("确认保存修改 (写入 NVRAM)"));
+    c.gtk_widget_add_css_class(@ptrCast(btn_save), gtk.s("suggested-action"));
+    _ = c.g_signal_connect_data(@ptrCast(btn_save), gtk.s("clicked"), @ptrCast(&onSaveEditEntry), null, null, 0);
+    c.gtk_box_append(@ptrCast(btn_row), btn_save);
+
+    c.gtk_box_append(@ptrCast(box), @ptrCast(btn_row));
+    c.gtk_window_set_child(@ptrCast(dialog), @ptrCast(box));
+    c.gtk_window_present(@ptrCast(dialog));
+}
+
+fn onEditPresetSdBoot(_: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
+    if (edit_disk_entry) |e| c.gtk_editable_set_text(@ptrCast(e), gtk.s("/dev/nvme0n1"));
+    if (edit_part_entry) |e| c.gtk_editable_set_text(@ptrCast(e), gtk.s("5"));
+    if (edit_label_entry) |e| c.gtk_editable_set_text(@ptrCast(e), gtk.s("Linux Boot Manager"));
+    if (edit_loader_entry) |e| c.gtk_editable_set_text(@ptrCast(e), gtk.s("\\EFI\\systemd\\systemd-bootx64.efi"));
+}
+
+fn onEditPresetWin(_: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
+    if (edit_disk_entry) |e| c.gtk_editable_set_text(@ptrCast(e), gtk.s("/dev/nvme0n1"));
+    if (edit_part_entry) |e| c.gtk_editable_set_text(@ptrCast(e), gtk.s("1"));
+    if (edit_label_entry) |e| c.gtk_editable_set_text(@ptrCast(e), gtk.s("Windows Boot Manager"));
+    if (edit_loader_entry) |e| c.gtk_editable_set_text(@ptrCast(e), gtk.s("\\EFI\\Microsoft\\Boot\\bootmgfw.efi"));
+}
+
+fn onEditPresetGrub(_: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
+    if (edit_disk_entry) |e| c.gtk_editable_set_text(@ptrCast(e), gtk.s("/dev/nvme0n1"));
+    if (edit_part_entry) |e| c.gtk_editable_set_text(@ptrCast(e), gtk.s("5"));
+    if (edit_label_entry) |e| c.gtk_editable_set_text(@ptrCast(e), gtk.s("GRUB"));
+    if (edit_loader_entry) |e| c.gtk_editable_set_text(@ptrCast(e), gtk.s("\\EFI\\GRUB\\grubx64.efi"));
+}
+
+fn onCloseEditDialog(_: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
+    if (edit_dialog) |d| {
+        c.gtk_window_destroy(d);
+        edit_dialog = null;
+    }
+}
+
+fn onSaveEditEntry(_: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
+    if (state.cfg) |cfg| {
+        const disk = std.mem.span(c.gtk_editable_get_text(@ptrCast(edit_disk_entry.?)));
+        const part_str = std.mem.span(c.gtk_editable_get_text(@ptrCast(edit_part_entry.?)));
+        const label = std.mem.span(c.gtk_editable_get_text(@ptrCast(edit_label_entry.?)));
+        const loader = std.mem.span(c.gtk_editable_get_text(@ptrCast(edit_loader_entry.?)));
+        const active = (c.gtk_switch_get_active(edit_active_switch.?) != 0);
+
+        const part = std.fmt.parseInt(u32, part_str, 10) catch 5;
+
+        const res = nvram.editEntry(state.io, state.gpa, cfg, edit_ident, disk, part, label, loader, active) catch return;
+        defer res.deinit(state.gpa);
+
+        if (res.ok()) {
+            refreshData();
+            const msg = gtk.zfmt("✔ 成功修改并更新启动项 [Boot{s}]！(NVRAM 已持久化)", .{edit_ident});
+            showStatus(msg, false);
+        } else {
+            showStatus(res.stderr, true);
+        }
+    }
+    onCloseEditDialog(@ptrCast(c.gtk_button_new()), null);
 }

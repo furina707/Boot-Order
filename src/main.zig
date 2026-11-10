@@ -162,6 +162,63 @@ pub fn main(init: std.process.Init) !u8 {
                 return 1;
             }
         }
+
+        // 8. 编辑启动项 (--edit <ID> [--label <NAME>] [--loader <PATH>] [--disk <DEV>] [--part <NUM>])
+        if (std.mem.eql(u8, sub, "--edit") and argv.len > 2) {
+            const ident_arg = argv[2];
+            if (ident_arg.len != 4) {
+                std.debug.print("[-] 错误: 条目编号必须为 4 位十六进制，例如 0002\n", .{});
+                return 1;
+            }
+            var id: [4]u8 = undefined;
+            @memcpy(&id, ident_arg[0..4]);
+
+            var cfg = try nvram.loadConfig(io, allocator);
+            defer cfg.deinit(allocator);
+
+            const existing = cfg.findEntry(id);
+            if (existing == null) {
+                std.debug.print("[-] 错误: 未在 NVRAM 中找到条目 Boot{s}\n", .{id});
+                return 1;
+            }
+
+            var label: []const u8 = existing.?.title;
+            var loader: []const u8 = existing.?.path;
+            var disk: []const u8 = "/dev/nvme0n1";
+            var part: u32 = nvram.parsePartition(existing.?.device_path);
+            var active: bool = existing.?.active;
+
+            var i: usize = 3;
+            while (i < argv.len) : (i += 1) {
+                if (std.mem.eql(u8, argv[i], "--label") and i + 1 < argv.len) {
+                    i += 1;
+                    label = argv[i];
+                } else if (std.mem.eql(u8, argv[i], "--loader") and i + 1 < argv.len) {
+                    i += 1;
+                    loader = argv[i];
+                } else if (std.mem.eql(u8, argv[i], "--disk") and i + 1 < argv.len) {
+                    i += 1;
+                    disk = argv[i];
+                } else if (std.mem.eql(u8, argv[i], "--part") and i + 1 < argv.len) {
+                    i += 1;
+                    part = std.fmt.parseInt(u32, argv[i], 10) catch part;
+                } else if (std.mem.eql(u8, argv[i], "--active") and i + 1 < argv.len) {
+                    i += 1;
+                    active = std.mem.eql(u8, argv[i], "true") or std.mem.eql(u8, argv[i], "1");
+                }
+            }
+
+            const res = try nvram.editEntry(io, allocator, cfg, id, disk, part, label, loader, active);
+            defer res.deinit(allocator);
+
+            if (res.ok()) {
+                std.debug.print("[✔] 成功更新启动项 Boot{s}！(标签: '{s}', 路径: '{s}', 分区: {d})\n", .{ id, label, loader, part });
+                return 0;
+            } else {
+                std.debug.print("[-] 失败: {s}\n", .{res.stderr});
+                return 1;
+            }
+        }
     }
 
     // 默认：启动原生 GTK4 图形界面
@@ -178,11 +235,19 @@ fn printHelp() void {
         \\  python run.py                   启动原生 GTK4 高清图形界面 (默认)
         \\  python run.py selftest          运行内建全链路功能自检
         \\  python run.py --list            查看当前 NVRAM 全部启动项与顺序 (CLI)
-        \\  python run.py --set-default <ID> 快速将指定条目设为第一启动项 (例如 0005)
+        \\  python run.py --set-default <ID> 快速将指定条目设为第一启动项 (例如 0002)
         \\  python run.py --set-next <ID>    设置下次开机单次启动项 (BootNext)
+        \\  python run.py --edit <ID> [...]  编辑现有启动项 (支持修改标签/路径/分区/状态)
         \\  python run.py --set-timeout <秒> 设置固件引导倒计时超时时间
         \\  python run.py --dedup           自动清理 BootOrder 重复项
         \\  python run.py -h, --help        显示本帮助
+        \\
+        \\编辑参数 (配合 --edit 使用):
+        \\  --label <名称>     设置启动项显示名称 (例如 "Linux Boot Manager")
+        \\  --loader <路径>    设置 EFI 引导文件路径 (例如 "\\EFI\\systemd\\systemd-bootx64.efi")
+        \\  --part <分区号>    设置目标 ESP 分区号 (例如 5)
+        \\  --disk <磁盘设备>  设置磁盘设备路径 (默认 /dev/nvme0n1)
+        \\  --active <0|1>     启用或禁用该条目
         \\
         \\核心特性:
         \\  - Zig 0.17+ 原生机器码、Zero Runtime，单二进制独立交付；
