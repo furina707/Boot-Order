@@ -148,6 +148,7 @@ pub fn parseBootctlList(allocator: std.mem.Allocator, text: []const u8, default_
     var options_str: []const u8 = "";
     var sort_key_str: []const u8 = "";
     var is_def = false;
+    var is_absent = false;
     var has_windows_conf = false;
 
     var it = std.mem.splitScalar(u8, text, '\n');
@@ -155,6 +156,19 @@ pub fn parseBootctlList(allocator: std.mem.Allocator, text: []const u8, default_
         const line = std.mem.trim(u8, raw_line, "\r\t ");
         if (line.len == 0) {
             if (id.len > 0) {
+                // 过滤已从磁盘物理删除但在固件快照变量中残留的幽灵条目 (reported/absent)
+                if (is_absent) {
+                    id = "";
+                    title = "";
+                    linux_path = "";
+                    efi_path = "";
+                    options_str = "";
+                    sort_key_str = "";
+                    is_def = false;
+                    is_absent = false;
+                    continue;
+                }
+
                 // 若已有 windows.conf，则自动抑制重复的 auto-windows
                 if (std.mem.eql(u8, id, "auto-windows") and has_windows_conf) {
                     id = "";
@@ -164,6 +178,7 @@ pub fn parseBootctlList(allocator: std.mem.Allocator, text: []const u8, default_
                     options_str = "";
                     sort_key_str = "";
                     is_def = false;
+                    is_absent = false;
                     continue;
                 }
 
@@ -193,6 +208,7 @@ pub fn parseBootctlList(allocator: std.mem.Allocator, text: []const u8, default_
                 options_str = "";
                 sort_key_str = "";
                 is_def = false;
+                is_absent = false;
             }
             continue;
         }
@@ -201,9 +217,16 @@ pub fn parseBootctlList(allocator: std.mem.Allocator, text: []const u8, default_
         const key = std.mem.trim(u8, line[0..colon_idx], " \t");
         const val = std.mem.trim(u8, line[colon_idx + 1 ..], " \t");
 
-        if (std.mem.eql(u8, key, "id")) {
+        if (std.mem.eql(u8, key, "type")) {
+            if (std.mem.indexOf(u8, val, "Reported by Boot Loader") != null) {
+                is_absent = true;
+            }
+        } else if (std.mem.eql(u8, key, "id")) {
             id = val;
         } else if (std.mem.eql(u8, key, "title")) {
+            if (std.mem.indexOf(u8, val, "(reported/absent)") != null or std.mem.indexOf(u8, val, "absent") != null) {
+                is_absent = true;
+            }
             var clean_title = val;
             if (std.mem.endsWith(u8, clean_title, "(default)")) {
                 clean_title = std.mem.trim(u8, clean_title[0 .. clean_title.len - 9], " \t");
@@ -224,7 +247,7 @@ pub fn parseBootctlList(allocator: std.mem.Allocator, text: []const u8, default_
         }
     }
 
-    if (id.len > 0) {
+    if (id.len > 0 and !is_absent) {
         if (!std.mem.eql(u8, id, "auto-windows") or !has_windows_conf) {
             if (title.len == 0) title = id;
             if (default_entry.len > 0 and (std.mem.eql(u8, id, default_entry) or std.mem.startsWith(u8, id, default_entry))) {

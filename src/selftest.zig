@@ -203,6 +203,25 @@ pub fn run(init: std.process.Init) !u8 {
         std.debug.print("\n[FAIL] e2 条目或默认标志错误\n", .{});
         return 1;
     }
+
+    // 验证 bootctl list 中已删除条目的 (reported/absent) 幽灵残留自动过滤
+    const sample_bootctl_text =
+        "         type: Boot Loader Specification Type #1 (.conf)\n" ++
+        "        title: Windows 11\n" ++
+        "           id: windows.conf\n" ++
+        "     sort-key: 01-windows\n\n" ++
+        "         type: Reported by Boot Loader\n" ++
+        "        title: arch-linux-zen.conf (reported/absent)\n" ++
+        "           id: arch-linux-zen.conf\n\n";
+    var bctl_entries = try loader.parseBootctlList(allocator, sample_bootctl_text, "windows.conf");
+    defer {
+        for (bctl_entries.items) |*e| e.deinit(allocator);
+        bctl_entries.deinit(allocator);
+    }
+    if (bctl_entries.items.len != 1 or !std.mem.eql(u8, bctl_entries.items[0].id, "windows.conf")) {
+        std.debug.print("\n[FAIL] (reported/absent) 幽灵残留条目过滤失败: 期望仅 1 项，实际 {d}\n", .{bctl_entries.items.len});
+        return 1;
+    }
     std.debug.print(" [OK]\n", .{});
 
     std.debug.print("--------------------------------------------------\n", .{});
