@@ -507,6 +507,11 @@ pub fn setLoaderTimeout(io: Io, allocator: std.mem.Allocator, timeout_val: []con
     return saveGlobalConf(io, allocator, def_entry, timeout_val, lcfg.console_mode);
 }
 
+/// 取消自动进入（设置 timeout menu-force，开机常驻菜单，必须手动选择系统）
+pub fn disableAutoBoot(io: Io, allocator: std.mem.Allocator) !sys.RunResult {
+    return setLoaderTimeout(io, allocator, "menu-force");
+}
+
 /// 保存更新特定条目的配置 (/boot/loader/entries/<id>)
 pub fn saveEntryConfig(
     io: Io,
