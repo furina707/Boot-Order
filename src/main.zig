@@ -390,6 +390,22 @@ pub fn main(init: std.process.Init) !u8 {
                 return 1;
             }
         }
+
+        // 16. 删除内层启动条目 (--loader-delete <ENTRY_ID>)
+        if (std.mem.eql(u8, sub, "--loader-delete") and argv.len > 2) {
+            const entry_id = argv[2];
+
+            const res = try loader.deleteEntry(io, allocator, entry_id);
+            defer res.deinit(allocator);
+
+            if (res.ok()) {
+                std.debug.print("[✔] 成功删除内层条目 '{s}'！(已从 ESP 分区移除)\n", .{entry_id});
+                return 0;
+            } else {
+                std.debug.print("[-] 失败: {s}\n", .{res.stderr});
+                return 1;
+            }
+        }
     }
 
     // 默认：启动原生 GTK4 图形界面
@@ -418,6 +434,7 @@ fn printHelp() void {
         \\  python run.py --loader-edit <ID> [...] 编辑内层条目标题与参数 (支持 --title/--options/--sort-key)
         \\  python run.py --loader-move <源顺位> <目标顺位> 切换调整内层启动条目排位顺序 (更新 sort-key)
         \\  python run.py --loader-sort-key <ID> <KEY> 直接为内层条目设置自定义 sort-key 排序键
+        \\  python run.py --loader-delete <ID> 删除指定的内层引导条目文件 (安全移除)
         \\  python run.py -h, --help          显示本帮助
         \\
         \\编辑参数 (配合 --edit 使用):

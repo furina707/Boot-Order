@@ -545,6 +545,65 @@ pub fn saveEntryConfig(
     return writePrivilegedFile(io, allocator, full_path, new_content.items);
 }
 
+/// 删除特定的内层引导条目文件 (/boot/loader/entries/<id> 或 /boot/EFI/Linux/<id>)
+pub fn deleteEntry(
+    io: Io,
+    allocator: std.mem.Allocator,
+    entry_id: []const u8,
+) !sys.RunResult {
+    var path_buf: [256]u8 = undefined;
+    var target_path: []const u8 = undefined;
+
+    if (std.mem.endsWith(u8, entry_id, ".conf")) {
+        target_path = try std.fmt.bufPrint(&path_buf, "/boot/loader/entries/{s}", .{entry_id});
+    } else if (std.mem.endsWith(u8, entry_id, ".efi")) {
+        target_path = try std.fmt.bufPrint(&path_buf, "/boot/EFI/Linux/{s}", .{entry_id});
+    } else {
+        return error.UnsupportedEntryType;
+    }
+
+    const res = try sys.runWithStdin(io, allocator, &.{
+        "sudo",
+        "-S",
+        "-p",
+        "",
+        "rm",
+        "-f",
+        target_path,
+    }, DEFAULT_SUDO_PASS);
+
+    if (!res.ok()) return res;
+
+    // 检查并更新 loader.conf：若被删除的条目恰好是 default，则将 default 重置为 @saved
+    if (readPrivilegedFile(io, allocator, "/boot/loader/loader.conf")) |conf_text| {
+        defer allocator.free(conf_text);
+        var it = std.mem.splitScalar(u8, conf_text, '\n');
+        var is_default = false;
+        var timeout_val: []const u8 = "menu-force";
+        var console_val: []const u8 = "max";
+
+        while (it.next()) |raw_line| {
+            const line = std.mem.trim(u8, raw_line, "\r\t ");
+            if (line.len == 0 or line[0] == '#') continue;
+            if (splitKeyValue(line)) |kv| {
+                if (std.mem.eql(u8, kv.key, "default") and (std.mem.eql(u8, kv.val, entry_id) or std.mem.startsWith(u8, entry_id, kv.val))) {
+                    is_default = true;
+                } else if (std.mem.eql(u8, kv.key, "timeout")) {
+                    timeout_val = kv.val;
+                } else if (std.mem.eql(u8, kv.key, "console-mode")) {
+                    console_val = kv.val;
+                }
+            }
+        }
+
+        if (is_default) {
+            _ = saveGlobalConf(io, allocator, "@saved", timeout_val, console_val) catch {};
+        }
+    } else |_| {}
+
+    return res;
+}
+
 pub fn cleanId(id: []const u8) []const u8 {
     if (std.mem.endsWith(u8, id, ".conf")) {
         return id[0 .. id.len - 5];

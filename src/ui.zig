@@ -1101,6 +1101,8 @@ fn onSaveNewEntry(_: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
 // ============================================================================
 
 var loader_entries_dialog: ?*c.GtkWindow = null;
+var loader_delete_dialog: ?*c.GtkWindow = null;
+var pending_loader_delete_idx: usize = 0;
 var single_edit_dialog: ?*c.GtkWindow = null;
 var single_title_entry: ?*c.GtkEntry = null;
 var single_options_entry: ?*c.GtkEntry = null;
@@ -1345,6 +1347,13 @@ fn openLoaderEntriesDisplay() void {
             c.gtk_box_append(@ptrCast(btn_box), btn_edit);
         }
 
+        if (!std.mem.startsWith(u8, e.id, "auto-")) {
+            const btn_del = c.gtk_button_new_with_label(gtk.s("🗑"));
+            c.gtk_widget_add_css_class(@ptrCast(btn_del), gtk.s("destructive-action"));
+            _ = c.g_signal_connect_data(@ptrCast(btn_del), gtk.s("clicked"), @ptrCast(&onDeleteLoaderEntryClicked), user_data, null, 0);
+            c.gtk_box_append(@ptrCast(btn_box), btn_del);
+        }
+
         c.gtk_box_append(@ptrCast(card), @ptrCast(btn_box));
         c.gtk_box_append(@ptrCast(content_box), @ptrCast(card));
     }
@@ -1434,6 +1443,86 @@ fn onMoveLoaderEntryDownClicked(_: *c.GtkButton, user_data: ?*anyopaque) callcon
         refreshData();
         openLoaderEntriesDisplay();
         showStatus(gtk.zfmt("✔ 启动项顺位已下移至 #{d} (已更新 systemd-boot 菜单次序)", .{idx + 2}), false);
+    } else {
+        showStatus(res.stderr, true);
+    }
+}
+
+fn onDeleteLoaderEntryClicked(_: *c.GtkButton, user_data: ?*anyopaque) callconv(.c) void {
+    const idx = @intFromPtr(user_data);
+    if (idx >= cached_entries_count) return;
+    pending_loader_delete_idx = idx;
+
+    const snap = &cached_entries[idx];
+    const entry_id = snap.id_buf[0..snap.id_len];
+    const title = snap.title_buf[0..snap.title_len];
+
+    const dialog = c.gtk_window_new();
+    loader_delete_dialog = @ptrCast(dialog);
+    c.gtk_window_set_title(@ptrCast(dialog), gtk.s("⚠️ 删除启动项确认"));
+    c.gtk_window_set_transient_for(@ptrCast(dialog), @ptrCast(loader_entries_dialog));
+    c.gtk_window_set_modal(@ptrCast(dialog), 1);
+    c.gtk_window_set_default_size(@ptrCast(dialog), 440, 200);
+
+    const box = c.gtk_box_new(@intCast(c.GTK_ORIENTATION_VERTICAL), 14);
+    c.gtk_widget_set_margin_start(@ptrCast(box), 20);
+    c.gtk_widget_set_margin_end(@ptrCast(box), 20);
+    c.gtk_widget_set_margin_top(@ptrCast(box), 16);
+    c.gtk_widget_set_margin_bottom(@ptrCast(box), 16);
+
+    const prompt_lbl = c.gtk_label_new(gtk.s(gtk.zfmt(
+        "确定要从系统引导中<b>永久删除</b>启动项 [{s}] 吗？\n\n条目标题: <b>{s}</b>\n\n<span color=\"#e01b24\">警告：删除后该引导条目将从系统启动菜单中移除，此操作不可逆！</span>",
+        .{ entry_id, title },
+    )));
+    c.gtk_label_set_use_markup(@ptrCast(prompt_lbl), 1);
+    c.gtk_label_set_wrap(@ptrCast(prompt_lbl), 1);
+    c.gtk_box_append(@ptrCast(box), @ptrCast(prompt_lbl));
+
+    const btn_row = c.gtk_box_new(@intCast(c.GTK_ORIENTATION_HORIZONTAL), 10);
+    c.gtk_widget_set_halign(@ptrCast(btn_row), @intCast(c.GTK_ALIGN_END));
+
+    const btn_cancel = c.gtk_button_new_with_label(gtk.s("取消"));
+    _ = c.g_signal_connect_data(@ptrCast(btn_cancel), gtk.s("clicked"), @ptrCast(&onCloseLoaderDeleteDialog), null, null, 0);
+    c.gtk_box_append(@ptrCast(btn_row), btn_cancel);
+
+    const btn_confirm = c.gtk_button_new_with_label(gtk.s("🗑 确认删除"));
+    c.gtk_widget_add_css_class(@ptrCast(btn_confirm), gtk.s("destructive-action"));
+    _ = c.g_signal_connect_data(@ptrCast(btn_confirm), gtk.s("clicked"), @ptrCast(&onConfirmLoaderDelete), null, null, 0);
+    c.gtk_box_append(@ptrCast(btn_row), btn_confirm);
+
+    c.gtk_box_append(@ptrCast(box), @ptrCast(btn_row));
+    c.gtk_window_set_child(@ptrCast(dialog), @ptrCast(box));
+    c.gtk_window_present(@ptrCast(dialog));
+}
+
+fn onCloseLoaderDeleteDialog(_: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
+    if (loader_delete_dialog) |d| {
+        c.gtk_window_destroy(d);
+        loader_delete_dialog = null;
+    }
+}
+
+fn onConfirmLoaderDelete(_: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
+    const idx = pending_loader_delete_idx;
+    if (idx >= cached_entries_count) return;
+
+    const snap = &cached_entries[idx];
+    const entry_id = snap.id_buf[0..snap.id_len];
+    const title = snap.title_buf[0..snap.title_len];
+
+    const res = sdboot.deleteEntry(state.io, state.gpa, entry_id) catch |err| {
+        showStatus(gtk.zfmt("[-] 删除启动项失败: {s}", .{@errorName(err)}), true);
+        onCloseLoaderDeleteDialog(@ptrCast(c.gtk_button_new()), null);
+        return;
+    };
+    defer res.deinit(state.gpa);
+
+    onCloseLoaderDeleteDialog(@ptrCast(c.gtk_button_new()), null);
+
+    if (res.ok()) {
+        refreshData();
+        openLoaderEntriesDisplay();
+        showStatus(gtk.zfmt("✔ 启动项 [{s}] 已成功从系统引导中删除！", .{title}), false);
     } else {
         showStatus(res.stderr, true);
     }
